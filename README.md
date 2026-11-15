@@ -117,9 +117,9 @@ the Runtime team has reviewed them, and detailed in
    per-head (`head_count`, `head_dimension`) and scale-less
    (`with_scale = false`, one input); `moe-experts.activation = "gelu_tanh"` and
    a sixth `per_expert_scale` input; and `activation` of `kind = "softcap"`
-   (`cap`) and `kind = "scale"` (`factor`, or a second input for
-   `layer_scalar`). `attention.window_size`, `gelu` and `moe-experts` already
-   exist.
+   (`cap`) and `kind = "scale"` (`factor`); `mul` broadcasting a
+   `[1]`-shaped operand from its shape (for `layer_scalar`).
+   `attention.window_size`, `gelu` and `moe-experts` already exist.
 3. **Loader**: map the checkpoint's tensors (Hugging Face
    `model.language_model.*` or GGUF `gemma4`) to the logical names. No weight
    is fabricated and no scale is folded into a weight that may be quantized;

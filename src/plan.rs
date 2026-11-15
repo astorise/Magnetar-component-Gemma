@@ -136,8 +136,8 @@ pub struct LayerSpec {
 pub struct Options {
     /// `cap * tanh(logits / cap)` on the logits.
     pub final_logit_softcapping: Option<f64>,
-    /// Width of the per-layer inputs, `0` for none.
-    pub per_layer_input_size: u32,
+    /// Width of the per-layer inputs, `None` for none.
+    pub per_layer_input_size: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +234,9 @@ impl Config {
                     ));
                 }
             }
+        }
+        if self.options.per_layer_input_size == Some(0) {
+            return Err("per-layer input width of 0 must be expressed as none".into());
         }
         if let Some(moe) = &a.moe {
             if moe.has_shared_expert {
@@ -474,9 +477,8 @@ impl<S: GraphSink> Builder<'_, S> {
         }
     }
 
-    /// The single scaling mechanism: `activation{kind = "scale", factor}`
-    /// multiplies by a constant; given a second input it multiplies by that
-    /// input instead (`layer_scalar`, shape `[1]`).
+    /// The single constant-scaling mechanism: `activation{kind = "scale",
+    /// factor}`. (`layer_scalar` is a weight, so it is a plain `mul`.)
     fn scale(&mut self, id: String, x: &str, factor: f64, width: u64) -> String {
         self.node(
             id,
@@ -709,7 +711,7 @@ impl<S: GraphSink> Builder<'_, S> {
     /// `(norm(embeddings @ projection_i * hidden^-0.5) + embed_i(token_ids) * sqrt(P)) * 2^-0.5`.
     fn per_layer_input(&mut self, layer: u64) -> String {
         let p = format!("layer{layer}");
-        let width = self.cfg.options.per_layer_input_size as u64;
+        let width = self.cfg.options.per_layer_input_size.unwrap_or_default() as u64;
         let hidden = self.cfg.arch.hidden_size as f64;
         let token_ids = self
             .token_ids
@@ -770,7 +772,7 @@ impl<S: GraphSink> Builder<'_, S> {
     /// per-layer input, project back and add it as a normalized residual.
     fn per_layer_tail(&mut self, layer: u64, x: &str) -> String {
         let p = format!("layer{layer}");
-        let width = self.cfg.options.per_layer_input_size as u64;
+        let width = self.cfg.options.per_layer_input_size.unwrap_or_default() as u64;
         let hidden = self.cfg.arch.hidden_size;
         let input = self.per_layer_input(layer);
         let gated = self.matmul(
@@ -877,7 +879,7 @@ impl<S: GraphSink> Builder<'_, S> {
         let mut out = self.residual(format!("{p}.residual2"), &h, &ffn);
 
         // --- per-layer input (E2B/E4B) -------------------------------------
-        if self.cfg.options.per_layer_input_size != 0 {
+        if self.cfg.options.per_layer_input_size.is_some() {
             out = self.per_layer_tail(layer.index, &out);
         }
 
@@ -885,11 +887,12 @@ impl<S: GraphSink> Builder<'_, S> {
         let scalar = self
             .sink
             .weight_edge(&weight_name(layer.index, "layer_scalar"));
+        // The `[1]`-shaped weight broadcasts from its shape alone.
         self.node(
             format!("{p}.layer_scalar"),
-            "activation",
-            "Activation",
-            vec![attr("kind", Value::Text("scale".into()))],
+            "mul",
+            "Tensor",
+            vec![],
             vec![out, scalar],
             vec![self.seq, a.hidden_size],
             None,
@@ -941,7 +944,7 @@ pub fn build_graph_segment<S: GraphSink>(sink: &mut S, cfg: &Config, segment: Se
         token_ids: None,
         embeddings: None,
     };
-    let per_layer_inputs = cfg.options.per_layer_input_size != 0;
+    let per_layer_inputs = cfg.options.per_layer_input_size.is_some();
     for index in start_layer as u64..end_layer as u64 {
         if let KvSource::Reuse { producer } = cfg.layer(index).kv_source {
             assert!(

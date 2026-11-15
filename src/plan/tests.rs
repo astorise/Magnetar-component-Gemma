@@ -96,7 +96,8 @@ impl Case {
             layers,
             options: Options {
                 final_logit_softcapping: g.final_logit_softcapping,
-                per_layer_input_size: g.per_layer_input_size,
+                per_layer_input_size: (g.per_layer_input_size != 0)
+                    .then_some(g.per_layer_input_size),
             },
         }
     }
@@ -1123,7 +1124,6 @@ fn constants_are_applied_by_the_one_scale_operation() {
             assert!(attr_of(n, "broadcast").is_none(), "{}", n.id);
             if n.operator == "mul" {
                 assert_eq!(n.inputs.len(), 2);
-                assert!(!n.id.ends_with("layer_scalar"), "{}", n.id);
             }
         }
     }
@@ -1145,12 +1145,11 @@ fn constants_are_applied_by_the_one_scale_operation() {
 }
 
 #[test]
-fn layer_scalar_is_a_scale_with_a_weight_input() {
+fn layer_scalar_is_a_plain_mul_by_a_one_element_weight() {
     let (r, _) = prefill(&tiny(), 3, 0, 1);
     let n = r.node("layer0.layer_scalar");
-    assert_eq!(n.operator, "activation");
-    assert_eq!(attr_of(n, "kind"), Some(&Value::Text("scale".into())));
-    assert!(attr_of(n, "factor").is_none(), "the factor is the input");
+    assert_eq!((n.operator, n.family), ("mul", "Tensor"));
+    assert!(n.attrs.is_empty(), "the broadcast follows from the shape");
     assert_eq!(
         n.inputs,
         vec![
@@ -1158,6 +1157,12 @@ fn layer_scalar_is_a_scale_with_a_weight_input() {
             "w:layers.0.layer_scalar".to_string()
         ]
     );
+    // `activation` keeps one input for every `kind`.
+    for r in every_variant() {
+        for n in r.nodes.iter().filter(|n| n.operator == "activation") {
+            assert_eq!(n.inputs.len(), 1, "{}", n.id);
+        }
+    }
 }
 
 #[test]
@@ -1208,4 +1213,12 @@ fn the_component_names_no_model_family_in_its_layout_types() {
     };
     assert_eq!(spec.clone(), spec);
     assert!(Options::default().final_logit_softcapping.is_none());
+    assert!(Options::default().per_layer_input_size.is_none());
+}
+
+#[test]
+fn per_layer_input_width_zero_must_be_none() {
+    let mut c = tiny().config();
+    c.options.per_layer_input_size = Some(0);
+    assert!(c.validate().unwrap_err().contains("none"));
 }

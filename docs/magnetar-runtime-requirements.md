@@ -27,7 +27,7 @@ layer-layout: func() -> option<list<layer-spec>>;   // une entrée par couche
 
 record architecture-options {
   final-logit-softcapping: option<f64>,
-  per-layer-input-size: u32,                         // 0 = aucun
+  per-layer-input-size: option<u32>,                 // none = aucun
 }
 options: func() -> architecture-options;
 ```
@@ -46,6 +46,8 @@ Dérivations attendues pour Gemma 4 (`layer_types`, `per_layer_config`, `kv_shar
 | `kv-source-layer` | pour les `num_kv_shared_layers` dernières couches : la dernière couche non partagée du même `layer_type` |
 | `intermediate-size` | `intermediate_size`, doublé sur les couches partagées si `use_double_wide_mlp` |
 | `final-logit-softcapping`, `per-layer-input-size` | `final_logit_softcapping`, `hidden_size_per_layer_input` |
+
+`per-layer-input-size` est une `option<u32>` : `some(0)` est refusé, l'absence s'écrit `none`.
 
 `architecture-config` : `head-dimension`, `num-key-value-heads`, `intermediate-size` ne servent plus qu'à titre indicatif ; `tie-word-embeddings = true`, `attention-bias = false`. `rope-scaling()` doit renvoyer `none`. `mixture-of-experts()` pour le 26B-A4B : `experts = 128`, `experts-per-token = 8`, `expert-intermediate-size = 704`, `normalize-top-k = true`, pas d'expert partagé (refusés sinon).
 
@@ -67,11 +69,10 @@ Un seul opérateur nouveau (`activation`) ; le reste sont des attributs.
 | `moe-experts` | `activation = "gelu_tanh"` | Défaut : SiLU. |
 | `moe-experts` | 6ᵉ entrée `per_expert_scale` `[E]` | Multiplie la sortie de chaque expert (équivalent à `router.per_expert_scale[idx]` après renormalisation). |
 | `activation` | `kind = "softcap"`, `cap` | `cap * tanh(x / cap)` sur les logits (`cap = 30`). |
-| `activation` | `kind = "scale"`, `factor` **ou** 2ᵉ entrée | Multiplication par une constante ; avec une 2ᵉ entrée de forme `[1]` (sans `factor`), par cette entrée : `layer_scalar`. |
+| `activation` | `kind = "scale"`, `factor` | Multiplication par une constante. `activation` garde **une seule entrée** pour tous les `kind`. |
+| `mul` | aucun attribut | Le second opérande de forme `[1]` se diffuse d'après sa seule forme (règle à ajouter à la validation et aux noyaux) : `layer_scalar`. |
 
-Remplacent la première version : `matmul.output_scale`, `add.output_scale` et `mul.broadcast = "scalar"` n'existent plus. `scale` sert à `hidden_size^-0.5` (projection de contexte) et `2^-0.5` (mélange token/contexte) des per-layer inputs, et au `layer_scalar`.
-
-Question ouverte pour le Runtime : `activation` a aujourd'hui une seule entrée. Pour `layer_scalar` nous émettons `activation{kind="scale"}` avec deux entrées `[x, poids [1]]`, comme suggéré dans la revue. Si vous préférez un attribut ou un autre opérateur, c'est un changement d'une ligne côté Component.
+Remplacent la première version : `matmul.output_scale`, `add.output_scale` et `mul.broadcast = "scalar"` n'existent plus. `scale` sert à `hidden_size^-0.5` (projection de contexte) et `2^-0.5` (mélange token/contexte) des per-layer inputs ; `layer_scalar` est un `mul(h, layer_scalar)` (réponse de l'équipe Runtime sur #187).
 
 ### RoPE « proportional » (couches `full`)
 
@@ -85,7 +86,7 @@ Reproduit `_compute_proportional_rope_parameters`. Pour `head_dim = 512`, `parti
 
 ### Graphe par couche (ordre)
 
-`input_norm → q/k(/v) → q_norm, k_norm, v_norm(sans échelle) → RoPE → attention → o_proj → post_attn_norm → +x → [pre_ffn_norm → GeGLU] (+ branche experts en MoE) → post_ffn_norm → + → [per-layer input] → layer_scalar`.
+`input_norm → q/k(/v) → q_norm, k_norm, v_norm(sans échelle) → RoPE → attention → o_proj → post_attn_norm → +x → [pre_ffn_norm → GeGLU] (+ branche experts en MoE) → post_ffn_norm → + → [per-layer input] → mul(layer_scalar)`.
 
 MoE : la MLP dense et la branche experts tournent en parallèle sur le flux résiduel `h`. Branche experts : `router_norm(h)` (sans échelle) → `router_proj` → scores ; `pre_ffn_norm_2(h)` → `moe-experts(…, per_expert_scale)` → `post_ffn_norm_2`. Dense : `pre_ffn_norm → MLP → post_ffn_norm_1`. Somme, puis `post_ffn_norm`.
 
@@ -149,4 +150,4 @@ Un segment doit contenir les producteurs de ses couches partagées (trap sinon).
 
 ## 8. Livré côté Component
 
-`src/plan.rs` : logique de graphe indépendante de l'hôte, 44 tests unitaires contre un `graph-builder` simulé (formes réelles du 31B, du 26B-A4B et d'un E2B). `src/component.rs` : pont WIT ; le binaire `wasm32-wasip2` n'importe que `graph-builder` et `model-config` (plus l'E/S standard wasip2 utilisée par les panics).
+`src/plan.rs` : logique de graphe indépendante de l'hôte, 45 tests unitaires contre un `graph-builder` simulé (formes réelles du 31B, du 26B-A4B et d'un E2B). `src/component.rs` : pont WIT ; le binaire `wasm32-wasip2` n'importe que `graph-builder` et `model-config` (plus l'E/S standard wasip2 utilisée par les panics).

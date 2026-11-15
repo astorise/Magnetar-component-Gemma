@@ -257,9 +257,9 @@ interface model-config {
   record architecture-options {
     /// `cap * tanh(logits / cap)` applied to the logits.
     final-logit-softcapping: option<f64>,
-    /// Width of the per-layer input embeddings, `0` for none. A Component
+    /// Width of the per-layer input embeddings, `none` for none. A Component
     /// that does not implement them must refuse to build a graph.
-    per-layer-input-size: u32,
+    per-layer-input-size: option<u32>,
   }
 
   options: func() -> architecture-options;
