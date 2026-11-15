@@ -7,8 +7,8 @@ wit_bindgen::generate!({
 });
 
 use crate::plan::{
-    self, Architecture, Attr, Config, GemmaArchitecture, GraphSink, KvRole, LayerAttention, Node,
-    Phase, Segment, Value,
+    self, Architecture, Attr, Config, GemmaArchitecture, GraphSink, KvRole, LayerAttention, Moe,
+    Node, Phase, Segment, Value,
 };
 use magnetar::model_component_graph::gemma_config::{self, LayerAttention as WitLayer};
 use magnetar::model_component_graph::graph_builder as gb;
@@ -108,7 +108,13 @@ fn load_config() -> Config {
             tie_word_embeddings: a.tie_word_embeddings,
             attention_bias: a.attention_bias,
             has_rope_scaling: model_config::rope_scaling().is_some(),
-            has_mixture_of_experts: model_config::mixture_of_experts().is_some(),
+            moe: model_config::mixture_of_experts().map(|m| Moe {
+                experts: m.experts,
+                experts_per_token: m.experts_per_token,
+                expert_intermediate_size: m.expert_intermediate_size,
+                normalize_top_k: m.normalize_top_k,
+                has_shared_expert: m.shared_expert_intermediate_size.is_some(),
+            }),
         },
         gemma: GemmaArchitecture {
             layer_attention: g
@@ -129,6 +135,7 @@ fn load_config() -> Config {
             final_logit_softcapping: g.final_logit_softcapping,
             per_layer_input_size: g.per_layer_input_size,
             kv_shared_layers: g.kv_shared_layers,
+            double_wide_mlp_on_shared_layers: g.double_wide_mlp_on_shared_layers,
         },
     }
 }

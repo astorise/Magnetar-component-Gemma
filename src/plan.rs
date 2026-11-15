@@ -96,8 +96,20 @@ pub struct Architecture {
     pub attention_bias: bool,
     /// `model-config.rope-scaling` is `some`.
     pub has_rope_scaling: bool,
-    /// `model-config.mixture-of-experts` is `some`.
-    pub has_mixture_of_experts: bool,
+    /// `model-config.mixture-of-experts`; `Some` for Gemma 4 26B-A4B.
+    pub moe: Option<Moe>,
+}
+
+/// `model-config.moe-config`, the fields this family reads.
+#[derive(Clone, Debug)]
+pub struct Moe {
+    pub experts: u32,
+    pub experts_per_token: u32,
+    pub expert_intermediate_size: u64,
+    pub normalize_top_k: bool,
+    /// An always-active shared expert is declared (Gemma 4 has none: its
+    /// dense MLP runs *beside* the routed experts instead).
+    pub has_shared_expert: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,14 +124,20 @@ pub struct GemmaArchitecture {
     pub layer_attention: Vec<LayerAttention>,
     pub sliding_window: u32,
     pub global_head_dimension: u64,
-    pub num_global_key_value_heads: u32,
+    /// `None` when the checkpoint declares none (E2B/E4B): full layers then
+    /// keep `num_key_value_heads`.
+    pub num_global_key_value_heads: Option<u32>,
     pub sliding_rope_theta: f64,
     pub full_rope_theta: f64,
     pub full_partial_rotary_factor: f64,
     pub attention_k_eq_v: bool,
     pub final_logit_softcapping: Option<f64>,
+    /// `hidden_size_per_layer_input`; non-zero enables per-layer inputs.
     pub per_layer_input_size: u32,
+    /// `num_kv_shared_layers`: trailing layers that reuse earlier K/V.
     pub kv_shared_layers: u32,
+    /// `use_double_wide_mlp`: KV-sharing layers use `2 * intermediate_size`.
+    pub double_wide_mlp_on_shared_layers: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -128,10 +146,24 @@ pub struct Config {
     pub gemma: GemmaArchitecture,
 }
 
+/// Where a layer's K/V come from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KvSource {
+    /// The layer projects, normalizes and caches its own K/V.
+    Own,
+    /// The layer attends over the K/V of an earlier layer of the same
+    /// attention flavour (`num_kv_shared_layers`) and has no K/V weights.
+    Reuse { producer: u64 },
+}
+
 /// Geometry of one decoder layer, resolved from its attention flavour.
 #[derive(Clone, Debug, PartialEq)]
 struct Layer {
     index: u64,
+    kv_source: KvSource,
+    /// Dense MLP width (doubled on shared-KV layers when
+    /// `use_double_wide_mlp`).
+    intermediate_size: u64,
     head_dimension: u64,
     kv_heads: u64,
     /// `Some(window)` for sliding layers.
@@ -145,27 +177,10 @@ struct Layer {
 
 impl Config {
     /// Rejects every configuration this Component cannot build a *correct*
-    /// graph for. The caller traps on `Err`: building a dense Gemma graph for
-    /// a checkpoint that is not one would silently produce wrong logits.
+    /// graph for. The caller traps on `Err`: building a wrong graph would
+    /// silently produce wrong logits.
     pub fn validate(&self) -> Result<(), String> {
         let (a, g) = (&self.arch, &self.gemma);
-        if a.has_mixture_of_experts {
-            return Err("mixture-of-experts Gemma 4 (e.g. 26B-A4B) is not implemented".into());
-        }
-        if g.per_layer_input_size != 0 {
-            return Err(
-                "per-layer input embeddings (Gemma 4 E2B/E4B, hidden_size_per_layer_input > 0) \
-                 are not implemented"
-                    .into(),
-            );
-        }
-        if g.kv_shared_layers != 0 {
-            return Err(
-                "cross-layer KV sharing (Gemma 4 E2B/E4B, num_kv_shared_layers > 0) \
-                 is not implemented"
-                    .into(),
-            );
-        }
         if a.has_rope_scaling {
             return Err(
                 "checkpoint declares RoPE frequency scaling, which Gemma 4 does not use".into(),
@@ -185,10 +200,18 @@ impl Config {
         if any(LayerAttention::Sliding) && g.sliding_window == 0 {
             return Err("sliding layers declared with sliding_window = 0".into());
         }
-        for (what, heads) in [
-            ("num_key_value_heads", a.num_key_value_heads),
-            ("num_global_key_value_heads", g.num_global_key_value_heads),
-        ] {
+        let mut kv_heads = vec![("num_key_value_heads", a.num_key_value_heads)];
+        if any(LayerAttention::Full) && g.attention_k_eq_v {
+            match g.num_global_key_value_heads {
+                Some(heads) => kv_heads.push(("num_global_key_value_heads", heads)),
+                None => {
+                    return Err(
+                        "attention_k_eq_v needs num_global_key_value_heads, which is absent".into(),
+                    );
+                }
+            }
+        }
+        for (what, heads) in kv_heads {
             if heads == 0 || a.num_attention_heads % heads != 0 {
                 return Err(format!(
                     "{what} = {heads} does not divide num_attention_heads = {}",
@@ -205,14 +228,80 @@ impl Config {
                 g.full_partial_rotary_factor
             ));
         }
+        if g.kv_shared_layers >= a.num_hidden_layers && g.kv_shared_layers != 0 {
+            return Err(format!(
+                "num_kv_shared_layers = {} leaves no layer that produces K/V",
+                g.kv_shared_layers
+            ));
+        }
+        for index in 0..a.num_hidden_layers as u64 {
+            if self.is_kv_consumer(index) && self.kv_producer(index).is_none() {
+                return Err(format!(
+                    "layer {index} reuses K/V but no earlier non-shared layer has its attention type"
+                ));
+            }
+        }
+        if let Some(moe) = &a.moe {
+            if moe.has_shared_expert {
+                return Err("a shared expert is not part of Gemma 4's MoE layer".into());
+            }
+            if !moe.normalize_top_k {
+                return Err("Gemma 4 renormalizes the chosen experts' probabilities; \
+                     normalize-top-k = false is not a Gemma 4 router"
+                    .into());
+            }
+            if moe.experts == 0
+                || moe.experts_per_token == 0
+                || moe.experts_per_token > moe.experts
+                || moe.expert_intermediate_size == 0
+            {
+                return Err(format!(
+                    "inconsistent mixture of experts: {} experts, top-{}, intermediate {}",
+                    moe.experts, moe.experts_per_token, moe.expert_intermediate_size
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn first_kv_shared_layer(&self) -> u64 {
+        (self.arch.num_hidden_layers - self.gemma.kv_shared_layers) as u64
+    }
+
+    fn is_kv_consumer(&self, index: u64) -> bool {
+        self.gemma.kv_shared_layers != 0 && index >= self.first_kv_shared_layer()
+    }
+
+    /// The layer whose K/V a consumer attends over: the last non-shared
+    /// layer of the same attention flavour (`kv_sharing_modes`).
+    fn kv_producer(&self, index: u64) -> Option<u64> {
+        if !self.is_kv_consumer(index) {
+            return None;
+        }
+        let kind = self.gemma.layer_attention[index as usize];
+        (0..self.first_kv_shared_layer())
+            .rev()
+            .find(|i| self.gemma.layer_attention[*i as usize] == kind)
     }
 
     fn layer(&self, index: u64) -> Layer {
         let (a, g) = (&self.arch, &self.gemma);
+        let consumer = self.is_kv_consumer(index);
+        let kv_source = match self.kv_producer(index) {
+            Some(producer) => KvSource::Reuse { producer },
+            None => KvSource::Own,
+        };
+        let intermediate_size = a.intermediate_size
+            * if consumer && g.double_wide_mlp_on_shared_layers {
+                2
+            } else {
+                1
+            };
         match g.layer_attention[index as usize] {
             LayerAttention::Sliding => Layer {
                 index,
+                kv_source,
+                intermediate_size,
                 head_dimension: a.head_dimension,
                 kv_heads: a.num_key_value_heads as u64,
                 window: Some(g.sliding_window as u64),
@@ -222,8 +311,15 @@ impl Config {
             },
             LayerAttention::Full => Layer {
                 index,
+                kv_source,
+                intermediate_size,
                 head_dimension: g.global_head_dimension,
-                kv_heads: g.num_global_key_value_heads as u64,
+                // `per_layer_config` only overrides the KV head count of
+                // full layers when `attention_k_eq_v` is set.
+                kv_heads: match (g.attention_k_eq_v, g.num_global_key_value_heads) {
+                    (true, Some(global)) => global as u64,
+                    _ => a.num_key_value_heads as u64,
+                },
                 window: None,
                 rope_theta: g.full_rope_theta,
                 partial_rotary_factor: (g.full_partial_rotary_factor < 1.0)
@@ -244,13 +340,37 @@ fn tensor_parallel(kind: &str) -> Attr {
 
 /// Canonical Model Artifact tensor name for a per-layer weight.
 ///
+/// Several names are *derived* from checkpoint tensors by the loader (see the
+/// requirements document): `router_proj` (router weight with the router
+/// `scale * hidden_size^-0.5` folded in), `router_norm` and `v_norm` (unit
+/// vectors), `experts_*_proj` (the stacked, `gate_up_proj`-split expert
+/// weights, `down` with `per_expert_scale` folded in) and the
+/// `per_layer_embedding` / `per_layer_model_projection` per-layer slices.
+///
 /// `v_norm` has no checkpoint tensor (`Gemma4RMSNorm(with_scale=False)`): the
 /// Model Artifact loader must resolve it to a unit-scale vector so the
 /// portable two-input `rmsnorm` Operator stays valid.
 pub fn weight_name(layer: u64, suffix: &str) -> String {
     match suffix {
-        "input_norm" | "post_attn_norm" | "pre_ffn_norm" | "post_ffn_norm" | "layer_scalar" => {
-            format!("layers.{layer}.{suffix}")
+        "input_norm"
+        | "post_attn_norm"
+        | "pre_ffn_norm"
+        | "post_ffn_norm"
+        | "layer_scalar"
+        // MoE layers (26B-A4B).
+        | "pre_ffn_norm_2"
+        | "post_ffn_norm_1"
+        | "post_ffn_norm_2"
+        | "router_norm"
+        | "router_proj"
+        // Per-layer inputs (E2B/E4B).
+        | "per_layer_input_gate"
+        | "per_layer_projection"
+        | "post_per_layer_input_norm"
+        | "per_layer_embedding"
+        | "per_layer_model_projection" => format!("layers.{layer}.{suffix}"),
+        "experts_gate_proj" | "experts_up_proj" | "experts_down_proj" => {
+            format!("layers.{layer}.experts.{}", &suffix["experts_".len()..])
         }
         "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_norm" | "k_norm" | "v_norm" => {
             format!("layers.{layer}.self_attn.{suffix}")
@@ -265,6 +385,13 @@ struct Builder<'a, S: GraphSink> {
     cfg: &'a Config,
     seq: u64,
     kv_append: bool,
+    /// K (after RoPE) and V (after its norm) edges of each layer built so
+    /// far, for later layers that reuse them.
+    produced_kv: std::collections::HashMap<u64, (String, String)>,
+    /// `token_ids` input and scaled token embeddings, kept when per-layer
+    /// inputs need them.
+    token_ids: Option<String>,
+    embeddings: Option<String>,
 }
 
 impl<S: GraphSink> Builder<'_, S> {
@@ -399,39 +526,60 @@ impl<S: GraphSink> Builder<'_, S> {
         }
     }
 
-    fn layer(&mut self, layer: &Layer, x: &str) -> String {
-        let a = self.cfg.arch.clone();
-        let p = format!("layer{}", layer.index);
-        let heads = a.num_attention_heads as u64;
-        let hd = layer.head_dimension;
-        let (q_dim, kv_dim) = (heads * hd, layer.kv_heads * hd);
-
-        // --- attention -----------------------------------------------------
-        let normed = self.hidden_norm(
-            format!("{p}.input_norm"),
-            x,
-            &weight_name(layer.index, "input_norm"),
-        );
-
-        let q = self.matmul(
-            format!("{p}.q_proj"),
-            &normed,
-            &weight_name(layer.index, "q_proj"),
-            q_dim,
+    fn scaled_matmul(
+        &mut self,
+        id: String,
+        x: &str,
+        weight: &str,
+        out_dim: u64,
+        output_scale: f64,
+    ) -> String {
+        let w = self.sink.weight_edge(weight);
+        self.node(
+            id,
+            "matmul",
+            "LinearAlgebra",
+            vec![attr("output_scale", Value::Float(output_scale))],
+            vec![x.into(), w],
+            vec![self.seq, out_dim],
             None,
-        );
-        let q = self.head_norm(
-            format!("{p}.q_norm"),
-            &q,
-            &weight_name(layer.index, "q_norm"),
-            heads,
-            hd,
-        );
-        let q = self.rope(format!("{p}.rope_q"), &q, layer, heads, None);
+        )
+    }
 
+    fn gelu(&mut self, id: String, x: &str, width: u64) -> String {
+        self.node(
+            id,
+            "gelu",
+            "Activation",
+            // `hidden_activation = "gelu_pytorch_tanh"`.
+            vec![
+                attr("approximate", Value::Text("tanh".into())),
+                tensor_parallel("local"),
+            ],
+            vec![x.into()],
+            vec![self.seq, width],
+            None,
+        )
+    }
+
+    /// The K and V edges a layer attends over: its own, built here, or those
+    /// of the earlier layer it shares them with.
+    fn key_values(&mut self, layer: &Layer, normed: &str) -> (String, String) {
+        let p = format!("layer{}", layer.index);
+        let hd = layer.head_dimension;
+        let kv_dim = layer.kv_heads * hd;
+        if let KvSource::Reuse { producer } = layer.kv_source {
+            return self.produced_kv.get(&producer).cloned().unwrap_or_else(|| {
+                panic!(
+                    "gemma: layer {} reuses the K/V of layer {producer}, which is not in this \
+                     graph segment",
+                    layer.index
+                )
+            });
+        }
         let k_raw = self.matmul(
             format!("{p}.k_proj"),
-            &normed,
+            normed,
             &weight_name(layer.index, "k_proj"),
             kv_dim,
             None,
@@ -443,7 +591,7 @@ impl<S: GraphSink> Builder<'_, S> {
         } else {
             self.matmul(
                 format!("{p}.v_proj"),
-                &normed,
+                normed,
                 &weight_name(layer.index, "v_proj"),
                 kv_dim,
                 None,
@@ -473,6 +621,260 @@ impl<S: GraphSink> Builder<'_, S> {
             vec![self.seq, kv_dim],
             Some(v_kv),
         );
+        self.produced_kv.insert(layer.index, (k.clone(), v.clone()));
+        (k, v)
+    }
+
+    /// The dense GeGLU MLP over `m`, ending in its `down_proj` output.
+    fn dense_mlp(&mut self, layer: &Layer, m: &str) -> String {
+        let p = format!("layer{}", layer.index);
+        let (inter, hidden) = (layer.intermediate_size, self.cfg.arch.hidden_size);
+        let gate = self.matmul(
+            format!("{p}.gate_proj"),
+            m,
+            &weight_name(layer.index, "gate_proj"),
+            inter,
+            Some("column"),
+        );
+        let up = self.matmul(
+            format!("{p}.up_proj"),
+            m,
+            &weight_name(layer.index, "up_proj"),
+            inter,
+            Some("column"),
+        );
+        let act = self.gelu(format!("{p}.gelu"), &gate, inter);
+        let mixed = self.node(
+            format!("{p}.mul"),
+            "mul",
+            "Tensor",
+            vec![tensor_parallel("local")],
+            vec![act, up],
+            vec![self.seq, inter],
+            None,
+        );
+        self.matmul(
+            format!("{p}.down_proj"),
+            &mixed,
+            &weight_name(layer.index, "down_proj"),
+            hidden,
+            Some("row"),
+        )
+    }
+
+    /// The feed-forward block's normalized output for residual stream `h`:
+    /// dense (`post_ffn_norm(mlp(pre_ffn_norm(h)))`) or, for Gemma 4
+    /// mixture-of-experts layers, the dense MLP and the routed experts side
+    /// by side, each normalized, summed and normalized again.
+    fn feed_forward(&mut self, layer: &Layer, h: &str) -> String {
+        let p = format!("layer{}", layer.index);
+        let m = self.hidden_norm(
+            format!("{p}.pre_ffn_norm"),
+            h,
+            &weight_name(layer.index, "pre_ffn_norm"),
+        );
+        let down = self.dense_mlp(layer, &m);
+        let Some(moe) = self.cfg.arch.moe.clone() else {
+            return self.hidden_norm(
+                format!("{p}.post_ffn_norm"),
+                &down,
+                &weight_name(layer.index, "post_ffn_norm"),
+            );
+        };
+        let hidden = self.cfg.arch.hidden_size;
+        let dense = self.hidden_norm(
+            format!("{p}.post_ffn_norm_1"),
+            &down,
+            &weight_name(layer.index, "post_ffn_norm_1"),
+        );
+        // Router: score the *un-normalized* residual stream through a
+        // scale-less RMSNorm and a projection into which the loader folds
+        // `router.scale * hidden_size^-0.5`.
+        let routed_in = self.hidden_norm(
+            format!("{p}.router_norm"),
+            h,
+            &weight_name(layer.index, "router_norm"),
+        );
+        let scores = self.matmul(
+            format!("{p}.router"),
+            &routed_in,
+            &weight_name(layer.index, "router_proj"),
+            moe.experts as u64,
+            None,
+        );
+        let experts_in = self.hidden_norm(
+            format!("{p}.pre_ffn_norm_2"),
+            h,
+            &weight_name(layer.index, "pre_ffn_norm_2"),
+        );
+        let gate = self
+            .sink
+            .weight_edge(&weight_name(layer.index, "experts_gate_proj"));
+        let up = self
+            .sink
+            .weight_edge(&weight_name(layer.index, "experts_up_proj"));
+        let down_w = self
+            .sink
+            .weight_edge(&weight_name(layer.index, "experts_down_proj"));
+        let routed = self.node(
+            format!("{p}.experts"),
+            "moe-experts",
+            "LinearAlgebra",
+            vec![
+                attr("experts", Value::Int(moe.experts as i64)),
+                attr("top_k", Value::Int(moe.experts_per_token as i64)),
+                attr("normalize_top_k", Value::Bool(true)),
+                attr("activation", Value::Text("gelu_tanh".into())),
+                tensor_parallel("experts"),
+            ],
+            vec![experts_in, scores, gate, up, down_w],
+            vec![self.seq, hidden],
+            None,
+        );
+        let routed = self.hidden_norm(
+            format!("{p}.post_ffn_norm_2"),
+            &routed,
+            &weight_name(layer.index, "post_ffn_norm_2"),
+        );
+        let both = self.node(
+            format!("{p}.moe_sum"),
+            "add",
+            "Tensor",
+            vec![],
+            vec![dense, routed],
+            vec![self.seq, hidden],
+            None,
+        );
+        self.hidden_norm(
+            format!("{p}.post_ffn_norm"),
+            &both,
+            &weight_name(layer.index, "post_ffn_norm"),
+        )
+    }
+
+    /// This layer's slice of the per-layer inputs:
+    /// `(norm(embeddings @ projection_i * hidden^-0.5) + embed_i(token_ids) * sqrt(P)) * 2^-0.5`.
+    fn per_layer_input(&mut self, layer: u64) -> String {
+        let p = format!("layer{layer}");
+        let width = self.cfg.gemma.per_layer_input_size as u64;
+        let hidden = self.cfg.arch.hidden_size as f64;
+        let token_ids = self
+            .token_ids
+            .clone()
+            .expect("per-layer inputs need token_ids");
+        let embeddings = self
+            .embeddings
+            .clone()
+            .expect("per-layer inputs need embeddings");
+        let table = self
+            .sink
+            .weight_edge(&weight_name(layer, "per_layer_embedding"));
+        let token_part = self.node(
+            format!("{p}.ple_token"),
+            "embedding",
+            "Tensor",
+            vec![attr("scale", Value::Float((width as f64).sqrt()))],
+            vec![token_ids, table],
+            vec![self.seq, width],
+            None,
+        );
+        let context = self.scaled_matmul(
+            format!("{p}.ple_context"),
+            &embeddings,
+            &weight_name(layer, "per_layer_model_projection"),
+            width,
+            hidden.powf(-0.5),
+        );
+        let norm_w = self.sink.weight_edge("per_layer_projection_norm");
+        let context = self.node(
+            format!("{p}.ple_context_norm"),
+            "rmsnorm",
+            "Normalization",
+            vec![self.eps()],
+            vec![context, norm_w],
+            vec![self.seq, width],
+            None,
+        );
+        self.node(
+            format!("{p}.ple_mix"),
+            "add",
+            "Tensor",
+            vec![attr("output_scale", Value::Float(0.5f64.sqrt()))],
+            vec![context, token_part],
+            vec![self.seq, width],
+            None,
+        )
+    }
+
+    /// Gemma 4 E2B/E4B: gate the hidden state, modulate it with the layer's
+    /// per-layer input, project back and add it as a normalized residual.
+    fn per_layer_tail(&mut self, layer: u64, x: &str) -> String {
+        let p = format!("layer{layer}");
+        let width = self.cfg.gemma.per_layer_input_size as u64;
+        let hidden = self.cfg.arch.hidden_size;
+        let input = self.per_layer_input(layer);
+        let gated = self.matmul(
+            format!("{p}.ple_gate"),
+            x,
+            &weight_name(layer, "per_layer_input_gate"),
+            width,
+            None,
+        );
+        let gated = self.gelu(format!("{p}.ple_gelu"), &gated, width);
+        let modulated = self.node(
+            format!("{p}.ple_mul"),
+            "mul",
+            "Tensor",
+            vec![],
+            vec![gated, input],
+            vec![self.seq, width],
+            None,
+        );
+        let projected = self.matmul(
+            format!("{p}.ple_projection"),
+            &modulated,
+            &weight_name(layer, "per_layer_projection"),
+            hidden,
+            None,
+        );
+        let projected = self.hidden_norm(
+            format!("{p}.ple_post_norm"),
+            &projected,
+            &weight_name(layer, "post_per_layer_input_norm"),
+        );
+        self.residual(format!("{p}.ple_residual"), x, &projected)
+    }
+
+    fn layer(&mut self, layer: &Layer, x: &str) -> String {
+        let a = self.cfg.arch.clone();
+        let p = format!("layer{}", layer.index);
+        let heads = a.num_attention_heads as u64;
+        let hd = layer.head_dimension;
+        let q_dim = heads * hd;
+
+        // --- attention -----------------------------------------------------
+        let normed = self.hidden_norm(
+            format!("{p}.input_norm"),
+            x,
+            &weight_name(layer.index, "input_norm"),
+        );
+
+        let q = self.matmul(
+            format!("{p}.q_proj"),
+            &normed,
+            &weight_name(layer.index, "q_proj"),
+            q_dim,
+            None,
+        );
+        let q = self.head_norm(
+            format!("{p}.q_norm"),
+            &q,
+            &weight_name(layer.index, "q_norm"),
+            heads,
+            hd,
+        );
+        let q = self.rope(format!("{p}.rope_q"), &q, layer, heads, None);
+        let (k, v) = self.key_values(layer, &normed);
 
         let mut attn_attrs = vec![
             attr("causal", Value::Bool(true)),
@@ -510,62 +912,14 @@ impl<S: GraphSink> Builder<'_, S> {
         );
         let h = self.residual(format!("{p}.residual1"), x, &o);
 
-        // --- GeGLU MLP -----------------------------------------------------
-        let m = self.hidden_norm(
-            format!("{p}.pre_ffn_norm"),
-            &h,
-            &weight_name(layer.index, "pre_ffn_norm"),
-        );
-        let inter = a.intermediate_size;
-        let gate = self.matmul(
-            format!("{p}.gate_proj"),
-            &m,
-            &weight_name(layer.index, "gate_proj"),
-            inter,
-            Some("column"),
-        );
-        let up = self.matmul(
-            format!("{p}.up_proj"),
-            &m,
-            &weight_name(layer.index, "up_proj"),
-            inter,
-            Some("column"),
-        );
-        let act = self.node(
-            format!("{p}.gelu"),
-            "gelu",
-            "Activation",
-            // `hidden_activation = "gelu_pytorch_tanh"`.
-            vec![
-                attr("approximate", Value::Text("tanh".into())),
-                tensor_parallel("local"),
-            ],
-            vec![gate],
-            vec![self.seq, inter],
-            None,
-        );
-        let mixed = self.node(
-            format!("{p}.mul"),
-            "mul",
-            "Tensor",
-            vec![tensor_parallel("local")],
-            vec![act, up],
-            vec![self.seq, inter],
-            None,
-        );
-        let down = self.matmul(
-            format!("{p}.down_proj"),
-            &mixed,
-            &weight_name(layer.index, "down_proj"),
-            a.hidden_size,
-            Some("row"),
-        );
-        let down = self.hidden_norm(
-            format!("{p}.post_ffn_norm"),
-            &down,
-            &weight_name(layer.index, "post_ffn_norm"),
-        );
-        let out = self.residual(format!("{p}.residual2"), &h, &down);
+        // --- feed-forward --------------------------------------------------
+        let ffn = self.feed_forward(layer, &h);
+        let mut out = self.residual(format!("{p}.residual2"), &h, &ffn);
+
+        // --- per-layer input (E2B/E4B) -------------------------------------
+        if self.cfg.gemma.per_layer_input_size != 0 {
+            out = self.per_layer_tail(layer.index, &out);
+        }
 
         // --- per-layer output scalar (`hidden_states *= layer_scalar`) -----
         let scalar = self
@@ -623,24 +977,53 @@ pub fn build_graph_segment<S: GraphSink>(sink: &mut S, cfg: &Config, segment: Se
         cfg,
         seq: sequence_length,
         kv_append,
+        produced_kv: Default::default(),
+        token_ids: None,
+        embeddings: None,
     };
+    let per_layer_inputs = cfg.gemma.per_layer_input_size != 0;
+    for index in start_layer as u64..end_layer as u64 {
+        if let KvSource::Reuse { producer } = cfg.layer(index).kv_source {
+            assert!(
+                producer >= start_layer as u64,
+                "gemma: layer {index} reuses the K/V of layer {producer}, which is before the \
+                 segment start {start_layer}; a segment must contain the producers of its \
+                 shared-KV layers"
+            );
+        }
+    }
 
-    let mut hidden = if start_layer == 0 {
-        let ids = b.sink.declare_input("token_ids", &[sequence_length]);
+    // Token embeddings, scaled by sqrt(hidden_size). A segment that does not
+    // start at layer 0 only needs them again for per-layer inputs.
+    let embedding = |b: &mut Builder<'_, S>, ids: String, id: &str| {
         let table = b.sink.weight_edge("token_embedding");
         b.node(
-            "embedding".into(),
+            id.into(),
             "embedding",
             "Tensor",
-            // Gemma multiplies token embeddings by sqrt(hidden_size).
             vec![attr("scale", Value::Float((a.hidden_size as f64).sqrt()))],
             vec![ids, table],
             vec![sequence_length, a.hidden_size],
             None,
         )
+    };
+    let mut hidden = if start_layer == 0 {
+        let ids = b.sink.declare_input("token_ids", &[sequence_length]);
+        let embedded = embedding(&mut b, ids.clone(), "embedding");
+        b.token_ids = Some(ids);
+        b.embeddings = Some(embedded.clone());
+        embedded
     } else {
-        b.sink
-            .declare_input("hidden_states_in", &[sequence_length, a.hidden_size])
+        let incoming = b
+            .sink
+            .declare_input("hidden_states_in", &[sequence_length, a.hidden_size]);
+        if per_layer_inputs && start_layer < end_layer {
+            let ids = b.sink.declare_input("token_ids", &[sequence_length]);
+            let embedded = embedding(&mut b, ids.clone(), "embedding_per_layer_inputs");
+            b.token_ids = Some(ids);
+            b.embeddings = Some(embedded);
+        }
+        incoming
     };
 
     for index in start_layer as u64..end_layer as u64 {

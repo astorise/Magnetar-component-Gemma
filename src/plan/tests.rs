@@ -73,13 +73,13 @@ fn tiny() -> Config {
             tie_word_embeddings: true,
             attention_bias: false,
             has_rope_scaling: false,
-            has_mixture_of_experts: false,
+            moe: None,
         },
         gemma: GemmaArchitecture {
             layer_attention: vec![Sliding, Sliding, Full, Sliding, Sliding, Full],
             sliding_window: 16,
             global_head_dimension: 16,
-            num_global_key_value_heads: 1,
+            num_global_key_value_heads: Some(1),
             sliding_rope_theta: 10_000.0,
             full_rope_theta: 1_000_000.0,
             full_partial_rotary_factor: 0.25,
@@ -87,6 +87,7 @@ fn tiny() -> Config {
             final_logit_softcapping: Some(30.0),
             per_layer_input_size: 0,
             kv_shared_layers: 0,
+            double_wide_mlp_on_shared_layers: false,
         },
     }
 }
@@ -373,28 +374,6 @@ fn weight_names_match_the_checkpoint_layout() {
 }
 
 #[test]
-fn unsupported_gemma4_variants_are_refused() {
-    let mut moe = tiny();
-    moe.arch.has_mixture_of_experts = true;
-    assert!(moe.validate().unwrap_err().contains("mixture-of-experts"));
-
-    let mut ple = tiny();
-    ple.gemma.per_layer_input_size = 256;
-    assert!(ple.validate().unwrap_err().contains("per-layer"));
-
-    let mut shared = tiny();
-    shared.gemma.kv_shared_layers = 20;
-    assert!(shared.validate().unwrap_err().contains("KV sharing"));
-
-    let mut scaled = tiny();
-    scaled.arch.has_rope_scaling = true;
-    assert!(scaled.validate().is_err());
-
-    // Building must trap, not emit a wrong dense graph.
-    assert!(std::panic::catch_unwind(|| prefill(&moe, 2, 0, 6)).is_err());
-}
-
-#[test]
 fn inconsistent_configs_are_refused() {
     let mut c = tiny();
     c.gemma.layer_attention.pop();
@@ -405,13 +384,24 @@ fn inconsistent_configs_are_refused() {
     assert!(c.validate().is_err());
 
     let mut c = tiny();
-    c.gemma.num_global_key_value_heads = 3;
+    c.gemma.num_global_key_value_heads = Some(3);
     assert!(c.validate().is_err());
 
     let mut c = tiny();
     c.gemma.full_partial_rotary_factor = 0.0;
     assert!(c.validate().is_err());
     c.gemma.full_partial_rotary_factor = 1.5;
+    assert!(c.validate().is_err());
+}
+
+#[test]
+fn rope_scaling_and_attention_bias_are_refused() {
+    let mut c = tiny();
+    c.arch.has_rope_scaling = true;
+    assert!(c.validate().is_err());
+    assert!(std::panic::catch_unwind(|| prefill(&c, 2, 0, 6)).is_err());
+    let mut c = tiny();
+    c.arch.attention_bias = true;
     assert!(c.validate().is_err());
 }
 
@@ -443,13 +433,13 @@ fn real_gemma4_31b_shape_builds() {
             tie_word_embeddings: true,
             attention_bias: false,
             has_rope_scaling: false,
-            has_mixture_of_experts: false,
+            moe: None,
         },
         gemma: GemmaArchitecture {
             layer_attention: layers,
             sliding_window: 1024,
             global_head_dimension: 512,
-            num_global_key_value_heads: 4,
+            num_global_key_value_heads: Some(4),
             sliding_rope_theta: 10_000.0,
             full_rope_theta: 1_000_000.0,
             full_partial_rotary_factor: 0.25,
@@ -457,6 +447,7 @@ fn real_gemma4_31b_shape_builds() {
             final_logit_softcapping: Some(30.0),
             per_layer_input_size: 0,
             kv_shared_layers: 0,
+            double_wide_mlp_on_shared_layers: false,
         },
     };
     cfg.validate().unwrap();
@@ -466,4 +457,523 @@ fn real_gemma4_31b_shape_builds() {
     assert_eq!(r.node("layer5.k_proj").shape, vec![8, 4 * 512]);
     assert_eq!(r.node("layer0.k_proj").shape, vec![8, 16 * 256]);
     assert_eq!(r.nodes.len(), 1 + 50 * 22 + 10 * 21 + 3);
+}
+
+// ---------------------------------------------------------------------------
+// Shared KV (E2B / E4B)
+// ---------------------------------------------------------------------------
+
+/// `tiny()` with the last 3 of 6 layers (`s s f | s s f` -> layers 3, 4, 5)
+/// reusing K/V.
+fn shared_kv() -> Config {
+    let mut c = tiny();
+    c.gemma.kv_shared_layers = 3;
+    c
+}
+
+#[test]
+fn shared_layers_reuse_the_last_producer_of_their_kind() {
+    let c = shared_kv();
+    // Producers are layers 0..3 = s s f. Layer 3 (s) and 4 (s) reuse layer 1;
+    // layer 5 (f) reuses layer 2.
+    assert_eq!(c.kv_producer(3), Some(1));
+    assert_eq!(c.kv_producer(4), Some(1));
+    assert_eq!(c.kv_producer(5), Some(2));
+    assert_eq!(c.kv_producer(2), None);
+
+    let (r, _) = prefill(&c, 4, 0, 6);
+    let att = r.node("layer3.attention");
+    assert_eq!(
+        att.inputs,
+        vec![
+            "out:layer3.rope_q".to_string(),
+            "out:layer1.rope_k".to_string(),
+            "out:layer1.v_norm".to_string()
+        ]
+    );
+    let att = r.node("layer5.attention");
+    assert_eq!(att.inputs[1], "out:layer2.rope_k");
+    assert_eq!(att.inputs[2], "out:layer2.v_norm");
+}
+
+#[test]
+fn shared_layers_have_no_kv_weights_nodes_or_cache() {
+    let (r, _) = prefill(&shared_kv(), 4, 0, 6);
+    for layer in [3, 4, 5] {
+        for gone in ["k_proj", "v_proj", "k_norm", "rope_k", "v_norm"] {
+            assert!(
+                !r.has(&format!("layer{layer}.{gone}")),
+                "layer{layer}.{gone}"
+            );
+        }
+        assert!(r.has(&format!("layer{layer}.q_proj")));
+        assert!(
+            !r.weights
+                .iter()
+                .any(|w| w.starts_with(&format!("layers.{layer}.self_attn.k")))
+        );
+    }
+    // Only producers allocate KV resources: none of the 3 consumers.
+    assert!(r.nodes.iter().filter(|n| n.kv.is_some()).all(|n| {
+        let layer: u64 = n.id[5..6].parse().unwrap();
+        layer < 3
+    }));
+}
+
+#[test]
+fn shared_layers_keep_their_own_geometry() {
+    let (r, _) = prefill(&shared_kv(), 4, 1, 6);
+    // Layer 5 is a full layer: 16-wide heads, partial RoPE, no window.
+    assert_eq!(r.node("layer5.q_proj").shape, vec![4, 4 * 16]);
+    let rope = r.node("layer5.rope_q");
+    assert_eq!(
+        attr_of(rope, "partial_rotary_factor"),
+        Some(&Value::Float(0.25))
+    );
+    // Layer 4 is sliding: windowed.
+    assert_eq!(
+        attr_of(r.node("layer4.attention"), "window_size"),
+        Some(&Value::Int(16))
+    );
+}
+
+#[test]
+fn double_wide_mlp_applies_to_shared_layers_only() {
+    let mut c = shared_kv();
+    c.gemma.double_wide_mlp_on_shared_layers = true;
+    let (r, _) = prefill(&c, 2, 0, 6);
+    assert_eq!(r.node("layer2.gate_proj").shape, vec![2, 64]);
+    assert_eq!(r.node("layer3.gate_proj").shape, vec![2, 128]);
+    assert_eq!(r.node("layer5.down_proj").shape, vec![2, 32]);
+    // Without KV sharing the flag is inert (E4B-like).
+    let mut c = tiny();
+    c.gemma.double_wide_mlp_on_shared_layers = true;
+    let (r, _) = prefill(&c, 2, 0, 6);
+    assert_eq!(r.node("layer5.gate_proj").shape, vec![2, 64]);
+}
+
+#[test]
+fn segments_must_contain_the_producers_of_shared_layers() {
+    let c = shared_kv();
+    assert!(prefill_ok(&c, 0, 6));
+    assert!(prefill_ok(&c, 0, 3));
+    assert!(prefill_ok(&c, 1, 6));
+    // Layer 3 needs layer 1.
+    assert!(!prefill_ok(&c, 2, 6));
+    assert!(!prefill_ok(&c, 3, 4));
+}
+
+fn prefill_ok(c: &Config, start: u32, end: u32) -> bool {
+    let c = c.clone();
+    std::panic::catch_unwind(move || prefill(&c, 2, start, end)).is_ok()
+}
+
+#[test]
+fn full_layers_without_k_eq_v_keep_the_sliding_kv_head_count() {
+    // E2B: attention_k_eq_v = false, num_global_key_value_heads = null.
+    let mut c = tiny();
+    c.gemma.attention_k_eq_v = false;
+    c.gemma.num_global_key_value_heads = None;
+    c.validate().unwrap();
+    let (r, _) = prefill(&c, 3, 2, 3);
+    assert_eq!(r.node("layer2.k_proj").shape, vec![3, 2 * 16]);
+    assert!(r.has("layer2.v_proj"));
+    assert_eq!(
+        attr_of(r.node("layer2.attention"), "kv_head_count"),
+        Some(&Value::Int(2))
+    );
+}
+
+#[test]
+fn k_eq_v_without_global_kv_heads_is_refused() {
+    let mut c = tiny();
+    c.gemma.num_global_key_value_heads = None;
+    assert!(
+        c.validate()
+            .unwrap_err()
+            .contains("num_global_key_value_heads")
+    );
+}
+
+#[test]
+fn kv_sharing_needs_a_producer_of_every_consumer_kind() {
+    use LayerAttention::*;
+    let mut c = tiny();
+    // Producers (first 3 layers) are all sliding, a full layer would consume.
+    c.gemma.layer_attention = vec![Sliding, Sliding, Sliding, Sliding, Sliding, Full];
+    c.gemma.kv_shared_layers = 3;
+    assert!(c.validate().unwrap_err().contains("attention type"));
+    c.gemma.kv_shared_layers = 6;
+    assert!(c.validate().unwrap_err().contains("no layer that produces"));
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer inputs (E2B / E4B)
+// ---------------------------------------------------------------------------
+
+fn ple() -> Config {
+    let mut c = tiny();
+    c.gemma.per_layer_input_size = 8;
+    c
+}
+
+#[test]
+fn per_layer_input_is_built_from_tokens_and_embeddings() {
+    let (r, _) = prefill(&ple(), 4, 0, 6);
+    let tok = r.node("layer1.ple_token");
+    assert_eq!(tok.operator, "embedding");
+    assert_eq!(
+        tok.inputs,
+        vec![
+            "in1".to_string(),
+            "w:layers.1.per_layer_embedding".to_string()
+        ]
+    );
+    assert_eq!(attr_of(tok, "scale"), Some(&Value::Float(8f64.sqrt())));
+    assert_eq!(tok.shape, vec![4, 8]);
+
+    let ctx = r.node("layer1.ple_context");
+    assert_eq!(
+        ctx.inputs[0], "out:embedding",
+        "projects the scaled embeddings"
+    );
+    assert_eq!(
+        attr_of(ctx, "output_scale"),
+        Some(&Value::Float(32f64.powf(-0.5)))
+    );
+    assert_eq!(ctx.shape, vec![4, 8]);
+
+    let norm = r.node("layer1.ple_context_norm");
+    assert_eq!(norm.inputs[1], "w:per_layer_projection_norm");
+
+    let mix = r.node("layer1.ple_mix");
+    assert_eq!(
+        mix.inputs,
+        vec![
+            "out:layer1.ple_context_norm".to_string(),
+            "out:layer1.ple_token".to_string()
+        ]
+    );
+    assert_eq!(
+        attr_of(mix, "output_scale"),
+        Some(&Value::Float(0.5f64.sqrt()))
+    );
+}
+
+#[test]
+fn per_layer_tail_sits_between_the_mlp_and_the_layer_scalar() {
+    let (r, _) = prefill(&ple(), 2, 0, 1);
+    let ids: Vec<&str> = r.nodes.iter().map(|n| n.id.as_str()).collect();
+    let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+    for pair in [
+        ["layer0.residual2", "layer0.ple_gate"],
+        ["layer0.ple_gate", "layer0.ple_gelu"],
+        ["layer0.ple_gelu", "layer0.ple_mul"],
+        ["layer0.ple_mul", "layer0.ple_projection"],
+        ["layer0.ple_projection", "layer0.ple_post_norm"],
+        ["layer0.ple_post_norm", "layer0.ple_residual"],
+        ["layer0.ple_residual", "layer0.layer_scalar"],
+    ] {
+        assert!(pos(pair[0]) < pos(pair[1]), "{pair:?}");
+    }
+    assert_eq!(r.node("layer0.ple_gate").shape, vec![2, 8]);
+    assert_eq!(r.node("layer0.ple_projection").shape, vec![2, 32]);
+    assert_eq!(
+        r.node("layer0.ple_residual").inputs[0],
+        "out:layer0.residual2"
+    );
+    assert_eq!(
+        r.node("layer0.layer_scalar").inputs[0],
+        "out:layer0.ple_residual"
+    );
+    assert_eq!(
+        attr_of(r.node("layer0.ple_gelu"), "approximate"),
+        Some(&Value::Text("tanh".into()))
+    );
+}
+
+#[test]
+fn per_layer_inputs_are_absent_by_default() {
+    let (r, _) = prefill(&tiny(), 2, 0, 6);
+    assert!(!r.nodes.iter().any(|n| n.id.contains(".ple_")));
+}
+
+#[test]
+fn later_segments_recompute_embeddings_for_per_layer_inputs() {
+    let (r, _) = prefill(&ple(), 4, 3, 6);
+    assert_eq!(
+        r.inputs,
+        vec![
+            ("hidden_states_in".to_string(), vec![4, 32]),
+            ("token_ids".to_string(), vec![4])
+        ]
+    );
+    assert!(r.has("embedding_per_layer_inputs"));
+    assert_eq!(
+        r.node("layer3.ple_context").inputs[0],
+        "out:embedding_per_layer_inputs"
+    );
+    // The residual stream still starts from the incoming hidden states.
+    assert_eq!(r.node("layer3.residual1").inputs[0], "in1");
+    // Without per-layer inputs a later segment needs neither.
+    let (r, _) = prefill(&tiny(), 4, 3, 6);
+    assert_eq!(r.inputs.len(), 1);
+}
+
+#[test]
+fn an_empty_later_segment_declares_no_token_ids() {
+    let (r, _) = prefill(&ple(), 4, 3, 3);
+    assert_eq!(r.inputs.len(), 1);
+}
+
+#[test]
+fn e2b_style_config_builds_end_to_end() {
+    // 35 layers, 20 shared, double-wide MLP, per-layer inputs, k != v.
+    use LayerAttention::*;
+    let layers: Vec<_> = (0..35)
+        .map(|i| if i % 5 == 4 { Full } else { Sliding })
+        .collect();
+    let c = Config {
+        arch: Architecture {
+            hidden_size: 1536,
+            intermediate_size: 6144,
+            num_hidden_layers: 35,
+            num_attention_heads: 8,
+            num_key_value_heads: 1,
+            head_dimension: 256,
+            vocabulary_size: 262_144,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            has_rope_scaling: false,
+            moe: None,
+        },
+        gemma: GemmaArchitecture {
+            layer_attention: layers,
+            sliding_window: 512,
+            global_head_dimension: 512,
+            num_global_key_value_heads: None,
+            sliding_rope_theta: 10_000.0,
+            full_rope_theta: 1_000_000.0,
+            full_partial_rotary_factor: 0.25,
+            attention_k_eq_v: false,
+            final_logit_softcapping: Some(30.0),
+            per_layer_input_size: 256,
+            kv_shared_layers: 20,
+            double_wide_mlp_on_shared_layers: true,
+        },
+    };
+    c.validate().unwrap();
+    let (r, g) = prefill(&c, 8, 0, 35);
+    assert_eq!(g, "graph(out:logit_softcap)");
+    // Producers 0..15; layer 15 is the first consumer (sliding) -> layer 13.
+    assert_eq!(c.kv_producer(15), Some(13));
+    assert_eq!(c.kv_producer(19), Some(14)); // full -> last full producer
+    assert_eq!(r.node("layer14.gate_proj").shape, vec![8, 6144]);
+    assert_eq!(r.node("layer15.gate_proj").shape, vec![8, 12288]);
+    assert_eq!(r.node("layer4.q_proj").shape, vec![8, 8 * 512]);
+    assert!(r.has("layer34.ple_residual"));
+    let kv_nodes = r.nodes.iter().filter(|n| n.kv.is_some()).count();
+    assert_eq!(kv_nodes, 2 * 15, "only the 15 producing layers cache K/V");
+}
+
+// ---------------------------------------------------------------------------
+// Mixture of experts (26B-A4B)
+// ---------------------------------------------------------------------------
+
+fn moe() -> Config {
+    let mut c = tiny();
+    c.arch.moe = Some(Moe {
+        experts: 8,
+        experts_per_token: 2,
+        expert_intermediate_size: 24,
+        normalize_top_k: true,
+        has_shared_expert: false,
+    });
+    c
+}
+
+#[test]
+fn moe_layer_runs_dense_mlp_and_routed_experts_side_by_side() {
+    let (r, _) = prefill(&moe(), 3, 0, 1);
+    let ids: Vec<&str> = r.nodes.iter().map(|n| n.id.as_str()).collect();
+    let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+
+    // Dense path.
+    assert_eq!(
+        r.node("layer0.pre_ffn_norm").inputs[0],
+        "out:layer0.residual1"
+    );
+    assert_eq!(
+        r.node("layer0.post_ffn_norm_1").inputs[0],
+        "out:layer0.down_proj"
+    );
+    // Router sees the residual stream, not the normed MLP input.
+    assert_eq!(
+        r.node("layer0.router_norm").inputs[0],
+        "out:layer0.residual1"
+    );
+    assert_eq!(r.node("layer0.router").inputs[0], "out:layer0.router_norm");
+    assert_eq!(r.node("layer0.router").shape, vec![3, 8]);
+    assert_eq!(
+        r.node("layer0.pre_ffn_norm_2").inputs[0],
+        "out:layer0.residual1"
+    );
+
+    let e = r.node("layer0.experts");
+    assert_eq!(e.operator, "moe-experts");
+    assert_eq!(
+        e.inputs,
+        vec![
+            "out:layer0.pre_ffn_norm_2".to_string(),
+            "out:layer0.router".to_string(),
+            "w:layers.0.experts.gate_proj".to_string(),
+            "w:layers.0.experts.up_proj".to_string(),
+            "w:layers.0.experts.down_proj".to_string(),
+        ]
+    );
+    assert_eq!(attr_of(e, "experts"), Some(&Value::Int(8)));
+    assert_eq!(attr_of(e, "top_k"), Some(&Value::Int(2)));
+    assert_eq!(attr_of(e, "normalize_top_k"), Some(&Value::Bool(true)));
+    assert_eq!(
+        attr_of(e, "activation"),
+        Some(&Value::Text("gelu_tanh".into()))
+    );
+    assert_eq!(e.shape, vec![3, 32]);
+
+    assert_eq!(
+        r.node("layer0.post_ffn_norm_2").inputs[0],
+        "out:layer0.experts"
+    );
+    assert_eq!(
+        r.node("layer0.moe_sum").inputs,
+        vec![
+            "out:layer0.post_ffn_norm_1".to_string(),
+            "out:layer0.post_ffn_norm_2".to_string()
+        ]
+    );
+    // The final sandwich norm covers the sum, then the residual closes it.
+    assert_eq!(
+        r.node("layer0.post_ffn_norm").inputs[0],
+        "out:layer0.moe_sum"
+    );
+    assert_eq!(
+        r.node("layer0.residual2").inputs,
+        vec![
+            "out:layer0.residual1".to_string(),
+            "out:layer0.post_ffn_norm".to_string()
+        ]
+    );
+    for pair in [
+        ["layer0.down_proj", "layer0.post_ffn_norm_1"],
+        ["layer0.router", "layer0.experts"],
+        ["layer0.experts", "layer0.post_ffn_norm_2"],
+        ["layer0.moe_sum", "layer0.post_ffn_norm"],
+    ] {
+        assert!(pos(pair[0]) < pos(pair[1]), "{pair:?}");
+    }
+}
+
+#[test]
+fn moe_weight_names_follow_the_loader_contract() {
+    let (r, _) = prefill(&moe(), 2, 0, 1);
+    for w in [
+        "layers.0.router_norm",
+        "layers.0.router_proj",
+        "layers.0.pre_ffn_norm_2",
+        "layers.0.post_ffn_norm_1",
+        "layers.0.post_ffn_norm_2",
+        "layers.0.experts.gate_proj",
+        "layers.0.experts.up_proj",
+        "layers.0.experts.down_proj",
+        "layers.0.mlp.gate_proj",
+    ] {
+        assert!(r.weights.iter().any(|x| x == w), "missing {w}");
+    }
+}
+
+#[test]
+fn dense_graphs_have_no_moe_nodes() {
+    let (r, _) = prefill(&tiny(), 2, 0, 6);
+    assert!(!r.nodes.iter().any(|n| n.operator == "moe-experts"));
+    assert!(!r.has("layer0.router"));
+}
+
+#[test]
+fn moe_and_dense_node_counts_differ_by_the_expert_branch() {
+    let (dense, _) = prefill(&tiny(), 2, 0, 1);
+    let (sparse, _) = prefill(&moe(), 2, 0, 1);
+    // post_ffn_norm_1, router_norm, router, pre_ffn_norm_2, experts,
+    // post_ffn_norm_2, moe_sum.
+    assert_eq!(sparse.nodes.len(), dense.nodes.len() + 7);
+}
+
+#[test]
+fn unsupported_moe_shapes_are_refused() {
+    let mut c = moe();
+    c.arch.moe.as_mut().unwrap().has_shared_expert = true;
+    assert!(c.validate().unwrap_err().contains("shared expert"));
+    let mut c = moe();
+    c.arch.moe.as_mut().unwrap().normalize_top_k = false;
+    assert!(c.validate().unwrap_err().contains("renormalizes"));
+    let mut c = moe();
+    c.arch.moe.as_mut().unwrap().experts_per_token = 9;
+    assert!(c.validate().unwrap_err().contains("inconsistent"));
+    assert!(std::panic::catch_unwind(|| prefill(&c, 2, 0, 6)).is_err());
+}
+
+#[test]
+fn real_gemma4_26b_a4b_shape_builds() {
+    use LayerAttention::*;
+    let layers: Vec<_> = (0..30)
+        .map(|i| if i % 6 == 5 { Full } else { Sliding })
+        .collect();
+    let c = Config {
+        arch: Architecture {
+            hidden_size: 2816,
+            intermediate_size: 2112,
+            num_hidden_layers: 30,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            head_dimension: 256,
+            vocabulary_size: 262_144,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            has_rope_scaling: false,
+            moe: Some(Moe {
+                experts: 128,
+                experts_per_token: 8,
+                expert_intermediate_size: 704,
+                normalize_top_k: true,
+                has_shared_expert: false,
+            }),
+        },
+        gemma: GemmaArchitecture {
+            layer_attention: layers,
+            sliding_window: 1024,
+            global_head_dimension: 512,
+            num_global_key_value_heads: Some(2),
+            sliding_rope_theta: 10_000.0,
+            full_rope_theta: 1_000_000.0,
+            full_partial_rotary_factor: 0.25,
+            attention_k_eq_v: true,
+            final_logit_softcapping: Some(30.0),
+            per_layer_input_size: 0,
+            kv_shared_layers: 0,
+            double_wide_mlp_on_shared_layers: false,
+        },
+    };
+    c.validate().unwrap();
+    let (r, g) = prefill(&c, 4, 0, 30);
+    assert_eq!(g, "graph(out:logit_softcap)");
+    assert_eq!(r.node("layer0.router").shape, vec![4, 128]);
+    assert_eq!(r.node("layer5.k_proj").shape, vec![4, 2 * 512]);
+    assert_eq!(
+        r.nodes
+            .iter()
+            .filter(|n| n.operator == "moe-experts")
+            .count(),
+        30
+    );
 }

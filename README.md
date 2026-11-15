@@ -12,10 +12,11 @@ or Devices).
 
 ## Status
 
-**Gemma 4 dense text: graph production implemented; Runtime support pending.**
+**Gemma 4 text decoder: graph production implemented; Runtime support pending.**
 The Component builds prefill/decode graphs (and layer segments for
-multi-Device pipelines) for dense Gemma 4 text checkpoints
-(`google/gemma-4-31B-it`, `gemma-4-12B-it`). The graph logic is in
+multi-Device pipelines) for every Gemma 4 text checkpoint family: dense
+(`google/gemma-4-31B-it`, `gemma-4-12B-it`), mixture-of-experts
+(`gemma-4-26B-A4B-it`) and the per-layer-input / shared-KV E2B and E4B. The graph logic is in
 `src/plan.rs`, independent of any host, and covered by unit tests against a
 recording `graph-builder` (including the real 31B shape). `src/component.rs`
 only adapts the WIT bindings to it.
@@ -44,14 +45,38 @@ Verified against `transformers`' `modeling_gemma4.py` and the checkpoints'
   projection: V is K's raw projection.
 - Logits are soft-capped: `30 * tanh(logits / 30)`.
 
-### Not implemented (refused, never built wrong)
+### Variants
 
-Building a graph traps with an explicit reason for: mixture-of-experts
-(26B-A4B), per-layer input embeddings and cross-layer KV sharing (E2B, E4B),
-RoPE frequency scaling, and attention bias. Gemma 1-3 are not served by this
-Component (they need `1 + weight` norms and, for Gemma 2/3, different
-attention rules). Vision/audio towers are out of scope; this is the text
-decoder only.
+- **MoE (26B-A4B)**: each layer runs the dense GeGLU MLP *and* a routed
+  expert branch side by side (`post_ffn_norm_1`, router + `moe-experts`,
+  `pre_ffn_norm_2`/`post_ffn_norm_2`), sums them, then applies the layer's
+  `post_ffn_norm`. The router scores the un-normalized residual stream.
+  Uses Magnetar's existing `moe-experts` Operator.
+- **Per-layer inputs (E2B/E4B)**: every layer receives a slice of a
+  token-identity embedding mixed with a projection of the scaled embeddings,
+  gates the hidden state with it and adds a normalized residual before the
+  `layer_scalar`. A segment not starting at layer 0 re-declares `token_ids`
+  and recomputes the embeddings it needs.
+- **Shared KV (E2B/E4B)**: the last `num_kv_shared_layers` layers have no
+  K/V weights and attend over the K/V of the last earlier layer of the same
+  attention kind, using the producer's edges (so they allocate no KV
+  resource). Their feed-forward is twice as wide when `use_double_wide_mlp`.
+  A segment must contain the producers of its shared layers.
+
+### Not implemented
+
+- **Vision and audio towers.** Gemma 4's image/audio inputs need Operators and
+  input types (patch embedding, 2-D RoPE, bidirectional vision attention,
+  conformer audio blocks, embedding injection at image/audio token positions)
+  and a way to pass non-token inputs, none of which `graph-builder` models
+  today (inputs are token ids and `float32` tensors only). This belongs in the
+  multimodal work tracked by `explore-multimodal-and-embedding-components`,
+  as its own Components; this one is the text decoder only.
+- Building a graph traps with an explicit reason for RoPE frequency scaling,
+  attention bias, a shared expert, a router that does not renormalize, and any
+  inconsistent configuration.
+- Gemma 1-3 are not served by this Component (they need `1 + weight` norms
+  and, for Gemma 2/3, different attention rules).
 
 ## Governing contract
 
@@ -61,7 +86,7 @@ Targets `magnetar:model-component-graph`, world `gemma-model-component-producer`
 interface, `gemma-config`, carrying what `architecture-config` cannot (per-layer
 attention kind, sliding window, global head width and KV heads, per-flavour
 RoPE bases, partial rotary factor, K=V, logit soft-capping, and the fields that
-let the Component detect the variants it refuses). Component exports are the
+whether per-layer inputs, shared KV and its wider MLP apply). Component exports are the
 same four as `components/qwen` and `components/llama`.
 
 Weight logical names follow `components/llama` (`layers.N.self_attn.q_proj`,
@@ -72,22 +97,25 @@ Weight logical names follow `components/llama` (`layers.N.self_attn.q_proj`,
 
 None of these exist in Magnetar `main` today; each is rejected fail-closed
 until added, so this Component cannot silently misbehave against an older
-Runtime.
+Runtime. They are tracked in
+[astorise/Magnetar#187](https://github.com/astorise/Magnetar/issues/187) and
+detailed in [`docs/magnetar-runtime-requirements.md`](docs/magnetar-runtime-requirements.md).
 
 1. **WIT `1.6.0`** with `gemma-config`, populated from the checkpoint's text
-   config (`layer_types`, `sliding_window`, `global_head_dim`,
-   `num_global_key_value_heads`, `rope_parameters`, `attention_k_eq_v`,
-   `final_logit_softcapping`, `hidden_size_per_layer_input`,
-   `num_kv_shared_layers`).
+   config.
 2. **Operator attributes** the portable Operators do not yet accept:
    `embedding.scale`; `attention.scale`; `rope.partial_rotary_factor`;
-   `gelu.approximate = "tanh"`; per-head `rmsnorm` (`head_count`,
-   `head_dimension`); `mul` with `broadcast = "scalar"` (for `layer_scalar`);
-   and an `activation` of `kind = "softcap"` with `cap`. `attention.window_size`
-   and `gelu` already exist.
+   `gelu.approximate = "tanh"`; per-head `rmsnorm`; `mul` with
+   `broadcast = "scalar"`; `matmul`/`add` `output_scale`;
+   `moe-experts.activation = "gelu_tanh"`; and an `activation` of
+   `kind = "softcap"`. `attention.window_size`, `gelu` and `moe-experts`
+   already exist.
 3. **Loader**: map the checkpoint's `model.language_model.*` tensors to the
-   logical names above, and resolve `layers.N.self_attn.v_norm` (absent from
-   the checkpoint) to a unit-scale vector.
+   logical names, and *derive* the ones the checkpoint does not contain as
+   such (unit-scale `v_norm`/`router_norm`; router weight with
+   `scale * hidden^-0.5` folded in; experts split from `gate_up_proj` with
+   `per_expert_scale` folded into `down`; per-layer slices of the packed
+   per-layer embedding and projection).
 
 ## Verification
 

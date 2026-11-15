@@ -246,8 +246,10 @@ interface gemma-config {
     sliding-window: u32,
     /// Head width of full-attention layers (`global_head_dim`).
     global-head-dimension: u64,
-    /// KV head count of full-attention layers (`num_global_key_value_heads`).
-    num-global-key-value-heads: u32,
+    /// KV head count of full-attention layers (`num_global_key_value_heads`);
+    /// `none` when the checkpoint declares none (E2B/E4B), in which case
+    /// full layers keep `num-key-value-heads`.
+    num-global-key-value-heads: option<u32>,
     /// RoPE base of sliding layers (`rope_parameters.sliding_attention`).
     sliding-rope-theta: f64,
     /// RoPE base of full-attention layers (`rope_parameters.full_attention`).
@@ -261,13 +263,15 @@ interface gemma-config {
     /// `cap * tanh(logits / cap)` applied to the logits
     /// (`final_logit_softcapping`).
     final-logit-softcapping: option<f64>,
-    /// Width of the per-layer input embeddings; non-zero is Gemma 4 E2B/E4B
-    /// (`hidden_size_per_layer_input`). A Component that does not implement
-    /// them must refuse to build a graph.
+    /// Width of the per-layer input embeddings, `0` for none
+    /// (`hidden_size_per_layer_input`; Gemma 4 E2B/E4B).
     per-layer-input-size: u32,
-    /// Trailing layers that reuse another layer's KV states
-    /// (`num_kv_shared_layers`). Same refusal rule.
+    /// Trailing layers that reuse K/V computed by an earlier layer of the same
+    /// attention kind, `0` for none (`num_kv_shared_layers`).
     kv-shared-layers: u32,
+    /// Layers that reuse K/V have a feed-forward twice as wide
+    /// (`use_double_wide_mlp`).
+    double-wide-mlp-on-shared-layers: bool,
   }
 
   architecture: func() -> gemma-architecture;

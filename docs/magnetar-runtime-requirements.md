@@ -9,7 +9,7 @@ Référence d'architecture : `transformers` `modeling_gemma4.py` et `config.json
 Le Component Gemma 4 (texte dense) produit les graphes prefill/decode via `graph-builder`, `model-config` et un nouveau `gemma-config`. Le contrat WIT 1.5.0 et le vocabulaire d'opérateurs actuels ne permettent pas d'exprimer plusieurs particularités de Gemma 4. Le Component ne fait **aucun repli silencieux** : tant que les points ci-dessous manquent, il est rejeté explicitement (échec de link, d'attribut ou de validation).
 
 Variantes ciblées : Gemma 4 dense (31B, 12B).
-Variantes refusées par le Component (trap avec raison) : 26B-A4B (MoE), E2B/E4B (embeddings par couche, KV partagé).
+Variantes également construites (voir §5) : 26B-A4B (MoE), E2B/E4B (embeddings par couche, KV partagé).
 
 ## 1. WIT : nouvelle interface `gemma-config` (version 1.6.0)
 
@@ -104,16 +104,54 @@ Note de normalisation : contrairement à Gemma 1-3, le poids RMSNorm de Gemma 4 
 2. Le graphe prefill du 31B passe la validation Runtime sans attribut rejeté, avec 60 couches : 50 sliding et 10 full.
 3. Chaque opérateur du §2 a une conformité Reference CPU avec jeu de test (au minimum : `softcap`, `rmsnorm` par tête, `rope` partiel, `attention` avec `scale` et `window_size`).
 4. Comparaison des logits avec `transformers` sur un prompt court (prefill puis quelques tokens de decode), sur un checkpoint réel, avec tolérance à définir. Ce test n'a **pas** été fait de notre côté : aucun poids n'a été téléchargé.
-5. Un checkpoint E2B/E4B ou 26B-A4B échoue avec la raison explicite du Component, sans graphe produit.
+5. Mêmes comparaisons de logits pour un E2B/E4B (per-layer inputs, KV partagé) et pour le 26B-A4B (MoE).
 
-## 5. Hors périmètre
+## 5. Variantes MoE, per-layer inputs et KV partagé (ajout)
 
-- Tours vision et audio de Gemma 4 : décodeur texte uniquement.
-- MoE, per-layer inputs, KV partagé : à traiter dans un changement ultérieur, après décision sur l'extension du contrat (`moe-config` existe déjà en 1.5.0 mais le routage de Gemma 4 a ses propres normes `pre/post_feedforward_layernorm_{1,2}`).
+Le Component construit désormais aussi ces variantes. Prérequis supplémentaires, en plus des §1 à §3.
+
+### WIT (`gemma-config`)
+
+- `num-global-key-value-heads` devient `option<u32>` : `none` pour E2B/E4B (`num_global_key_value_heads: null`). Dans ce cas les couches `full` gardent `num-key-value-heads` (`per_layer_config` ne remplace le nombre de têtes KV que si `attention_k_eq_v`).
+- Nouveau champ `double-wide-mlp-on-shared-layers` (`use_double_wide_mlp`) : les couches qui réutilisent le KV ont une MLP de largeur `2 * intermediate-size`.
+- `per-layer-input-size` et `kv-shared-layers` sont maintenant **supportés** (plus de refus).
+- `model-config.mixture-of-experts()` doit renvoyer pour le 26B-A4B : `experts = 128`, `experts-per-token = 8`, `expert-intermediate-size = 704`, `normalize-top-k = true`, `shared-expert-intermediate-size = none`. Le Component refuse un expert partagé et `normalize-top-k = false`.
+
+### Opérateurs
+
+- `moe-experts` existe déjà (5 entrées, `experts`, `top_k`, `normalize_top_k`). Il faut ajouter l'attribut `activation = "gelu_tanh"` (par défaut : SiLU).
+- `matmul` et `add` : attribut optionnel `output_scale` (float), résultat multiplié par ce facteur. Utilisé pour `hidden_size^-0.5` (projection du contexte) et `2^-0.5` (mélange token/contexte) des per-layer inputs.
+- `embedding.scale` (déjà demandé au §2) sert aussi à `sqrt(hidden_size_per_layer_input)`.
+
+### Loader : poids dérivés
+
+| Nom logique | Construction depuis le checkpoint |
+|---|---|
+| `layers.N.router_norm` | vecteur de 1 de taille `hidden_size` (`Gemma4RMSNorm(with_scale=False)`) |
+| `layers.N.router_proj` | `router.proj.weight` avec `router.scale * hidden_size^-0.5` multiplié sur la dimension d'entrée (exact, la projection est linéaire) |
+| `layers.N.experts.gate_proj`, `up_proj` | moitiés de `experts.gate_up_proj` `[E, 2I, H]`, empilées en `[H, E*I]` |
+| `layers.N.experts.down_proj` | `experts.down_proj` empilé en `[I, E*H]`, avec `router.per_expert_scale[e]` multiplié sur le bloc de l'expert `e` (exact, car appliqué après la pondération linéaire) |
+| `layers.N.post_ffn_norm_1`, `post_ffn_norm_2`, `pre_ffn_norm_2` | `post_feedforward_layernorm_1`, `post_feedforward_layernorm_2`, `pre_feedforward_layernorm_2` |
+| `layers.N.per_layer_embedding` | colonnes `[N*P, (N+1)*P)` de `embed_tokens_per_layer.weight` (`[vocab_per_layer, L*P]`) |
+| `layers.N.per_layer_model_projection` | tranche `[N*P, (N+1)*P)` de `per_layer_model_projection.weight`, transposée en `[H, P]` |
+| `per_layer_projection_norm` | `per_layer_projection_norm.weight` (`[P]`), partagé par toutes les couches |
+| `layers.N.per_layer_input_gate`, `per_layer_projection`, `post_per_layer_input_norm` | mêmes noms HF |
+
+Les couches qui réutilisent le KV n'ont **pas** de `k_proj`, `v_proj`, `k_norm`, `v_norm` : le Component ne les demande pas.
+
+### Contraintes d'exécution
+
+- **KV partagé** : une couche consommatrice lit les arêtes K/V (après RoPE/norme) du producteur, la dernière couche non partagée du même type d'attention. Le Runtime doit accepter qu'un nœud `attention` consomme l'arête portant la `kv-involvement` d'une autre couche et lui présenter l'historique complet. Seules les couches productrices allouent des ressources KV.
+- **Segments (multi-Device)** : un segment doit contenir les producteurs de ses couches partagées (sinon trap). Avec per-layer inputs, un segment qui ne commence pas à la couche 0 déclare en plus l'entrée `token_ids` et recalcule les embeddings.
+- **MoE** : `moe-experts` reçoit en entrée la sortie de `pre_ffn_norm_2` et les scores du routeur (`softmax` puis top-k puis renormalisation, côté Runtime) ; les poids empilés suivent la convention de `execute-and-cache-moe-experts`.
+
+## 5 bis. Hors périmètre
+
+- **Tours vision et audio** : demandent des opérateurs (patch embedding, RoPE 2-D, attention bidirectionnelle sur les tokens image, blocs conformer audio), l'injection d'embeddings aux positions des tokens image/audio, et des entrées non-token que `graph-builder` ne modélise pas. À traiter dans `explore-multimodal-and-embedding-components` avec leurs propres Components ; ce Component reste le décodeur texte.
 - Attention bidirectionnelle sur les tokens image (`use_bidirectional_attention = "vision"`) : sans objet en texte seul.
 
 ## 6. Ce qui est livré côté Component
 
-- Logique de graphe indépendante de l'hôte : `src/plan.rs`, 20 tests unitaires contre un `graph-builder` simulé, dont la forme réelle du 31B.
+- Logique de graphe indépendante de l'hôte : `src/plan.rs`, 40 tests unitaires contre un `graph-builder` simulé, dont les formes réelles du 31B, du 26B-A4B et d'un E2B.
 - Pont WIT : `src/component.rs`. Le binaire `wasm32-wasip2` se construit et n'importe que les trois Capabilities Magnetar, plus l'E/S standard wasip2 utilisée par les panics.
 - Détail et commandes de vérification : `README.md` du dépôt.
