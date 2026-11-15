@@ -1,5 +1,115 @@
 use super::*;
 
+/// Attention flavour as a checkpoint's `layer_types` states it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayerAttention {
+    Sliding,
+    Full,
+}
+
+/// A checkpoint's `config.json` values. The Component never sees these: the
+/// Runtime derives `model-config.layer-layout` from them (transformers'
+/// `per_layer_config` and `kv_sharing_modes`), which `Case::config` mirrors so
+/// the tests keep modelling real checkpoints.
+#[derive(Clone)]
+struct HfGemma {
+    layer_attention: Vec<LayerAttention>,
+    sliding_window: u32,
+    global_head_dimension: u64,
+    num_global_key_value_heads: Option<u32>,
+    sliding_rope_theta: f64,
+    full_rope_theta: f64,
+    full_partial_rotary_factor: f64,
+    attention_k_eq_v: bool,
+    final_logit_softcapping: Option<f64>,
+    per_layer_input_size: u32,
+    kv_shared_layers: u32,
+    double_wide_mlp_on_shared_layers: bool,
+}
+
+#[derive(Clone)]
+struct Case {
+    arch: Architecture,
+    gemma: HfGemma,
+}
+
+impl Case {
+    fn config(&self) -> Config {
+        let (a, g) = (&self.arch, &self.gemma);
+        let n = g.layer_attention.len();
+        let first_shared = n.saturating_sub(g.kv_shared_layers as usize);
+        let layers = g
+            .layer_attention
+            .iter()
+            .enumerate()
+            .take(a.num_hidden_layers as usize)
+            .map(|(i, kind)| {
+                let consumer = g.kv_shared_layers != 0 && i >= first_shared;
+                let kv_source_layer = consumer
+                    .then(|| {
+                        (0..first_shared)
+                            .rev()
+                            .find(|j| g.layer_attention[*j] == *kind)
+                    })
+                    .flatten()
+                    .map(|j| j as u32);
+                let intermediate_size = a.intermediate_size
+                    * if consumer && g.double_wide_mlp_on_shared_layers {
+                        2
+                    } else {
+                        1
+                    };
+                match kind {
+                    LayerAttention::Sliding => LayerSpec {
+                        sliding_window: Some(g.sliding_window),
+                        head_dimension: a.head_dimension,
+                        num_key_value_heads: a.num_key_value_heads,
+                        rope_theta: g.sliding_rope_theta,
+                        partial_rotary_factor: None,
+                        value_from_key: false,
+                        kv_source_layer,
+                        intermediate_size,
+                    },
+                    LayerAttention::Full => LayerSpec {
+                        sliding_window: None,
+                        head_dimension: g.global_head_dimension,
+                        // `per_layer_config` only overrides the KV head count
+                        // of full layers when `attention_k_eq_v`.
+                        num_key_value_heads: match (
+                            g.attention_k_eq_v,
+                            g.num_global_key_value_heads,
+                        ) {
+                            (true, Some(global)) => global,
+                            _ => a.num_key_value_heads,
+                        },
+                        rope_theta: g.full_rope_theta,
+                        partial_rotary_factor: Some(g.full_partial_rotary_factor),
+                        value_from_key: g.attention_k_eq_v,
+                        kv_source_layer,
+                        intermediate_size,
+                    },
+                }
+            })
+            .collect();
+        Config {
+            arch: a.clone(),
+            layers,
+            options: Options {
+                final_logit_softcapping: g.final_logit_softcapping,
+                per_layer_input_size: g.per_layer_input_size,
+            },
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.config().validate()
+    }
+
+    fn kv_producer(&self, layer: usize) -> Option<u32> {
+        self.config().layers[layer].kv_source_layer
+    }
+}
+
 /// Records every `graph-builder` call.
 #[derive(Default)]
 struct Recorder {
@@ -58,9 +168,9 @@ impl GraphSink for Recorder {
 
 /// A miniature Gemma 4 dense shape: 6 layers, `sssssf` pattern is shortened
 /// to `s s f s s f` so both flavours repeat.
-fn tiny() -> Config {
+fn tiny() -> Case {
     use LayerAttention::*;
-    Config {
+    Case {
         arch: Architecture {
             hidden_size: 32,
             intermediate_size: 64,
@@ -75,7 +185,7 @@ fn tiny() -> Config {
             has_rope_scaling: false,
             moe: None,
         },
-        gemma: GemmaArchitecture {
+        gemma: HfGemma {
             layer_attention: vec![Sliding, Sliding, Full, Sliding, Sliding, Full],
             sliding_window: 16,
             global_head_dimension: 16,
@@ -92,11 +202,11 @@ fn tiny() -> Config {
     }
 }
 
-fn prefill(cfg: &Config, seq: u64, start: u32, end: u32) -> (Recorder, String) {
+fn prefill(cfg: &Case, seq: u64, start: u32, end: u32) -> (Recorder, String) {
     let mut r = Recorder::default();
     let g = build_graph_segment(
         &mut r,
-        cfg,
+        &cfg.config(),
         Segment {
             phase: Phase::Prefill,
             sequence_length: seq,
@@ -274,7 +384,7 @@ fn kv_involvement_follows_cache_semantics() {
     let mut r = Recorder::default();
     build_graph_segment(
         &mut r,
-        &tiny(),
+        &tiny().config(),
         Segment {
             phase: Phase::Decode,
             sequence_length: 1,
@@ -377,7 +487,7 @@ fn weight_names_match_the_checkpoint_layout() {
 fn inconsistent_configs_are_refused() {
     let mut c = tiny();
     c.gemma.layer_attention.pop();
-    assert!(c.validate().unwrap_err().contains("layer_types"));
+    assert!(c.validate().unwrap_err().contains("layer layout"));
 
     let mut c = tiny();
     c.gemma.sliding_window = 0;
@@ -420,7 +530,7 @@ fn real_gemma4_31b_shape_builds() {
     let layers: Vec<_> = (0..60)
         .map(|i| if i % 6 == 5 { Full } else { Sliding })
         .collect();
-    let cfg = Config {
+    let cfg = Case {
         arch: Architecture {
             hidden_size: 5376,
             intermediate_size: 21504,
@@ -435,7 +545,7 @@ fn real_gemma4_31b_shape_builds() {
             has_rope_scaling: false,
             moe: None,
         },
-        gemma: GemmaArchitecture {
+        gemma: HfGemma {
             layer_attention: layers,
             sliding_window: 1024,
             global_head_dimension: 512,
@@ -465,7 +575,7 @@ fn real_gemma4_31b_shape_builds() {
 
 /// `tiny()` with the last 3 of 6 layers (`s s f | s s f` -> layers 3, 4, 5)
 /// reusing K/V.
-fn shared_kv() -> Config {
+fn shared_kv() -> Case {
     let mut c = tiny();
     c.gemma.kv_shared_layers = 3;
     c
@@ -563,7 +673,7 @@ fn segments_must_contain_the_producers_of_shared_layers() {
     assert!(!prefill_ok(&c, 3, 4));
 }
 
-fn prefill_ok(c: &Config, start: u32, end: u32) -> bool {
+fn prefill_ok(c: &Case, start: u32, end: u32) -> bool {
     let c = c.clone();
     std::panic::catch_unwind(move || prefill(&c, 2, start, end)).is_ok()
 }
@@ -585,33 +695,40 @@ fn full_layers_without_k_eq_v_keep_the_sliding_kv_head_count() {
 }
 
 #[test]
-fn k_eq_v_without_global_kv_heads_is_refused() {
-    let mut c = tiny();
-    c.gemma.num_global_key_value_heads = None;
-    assert!(
-        c.validate()
-            .unwrap_err()
-            .contains("num_global_key_value_heads")
-    );
-}
+fn layer_layout_is_validated_not_derived() {
+    // The Runtime supplies each layer's K/V source; the Component only checks
+    // the layout is self-consistent.
+    let mut c = shared_kv().config();
+    c.validate().unwrap();
 
-#[test]
-fn kv_sharing_needs_a_producer_of_every_consumer_kind() {
-    use LayerAttention::*;
-    let mut c = tiny();
-    // Producers (first 3 layers) are all sliding, a full layer would consume.
-    c.gemma.layer_attention = vec![Sliding, Sliding, Sliding, Sliding, Sliding, Full];
-    c.gemma.kv_shared_layers = 3;
-    assert!(c.validate().unwrap_err().contains("attention type"));
-    c.gemma.kv_shared_layers = 6;
-    assert!(c.validate().unwrap_err().contains("no layer that produces"));
+    // A source that is not an earlier layer.
+    let mut bad = c.clone();
+    bad.layers[3].kv_source_layer = Some(4);
+    assert!(bad.validate().unwrap_err().contains("not an earlier layer"));
+    let mut bad = c.clone();
+    bad.layers[3].kv_source_layer = Some(3);
+    assert!(bad.validate().unwrap_err().contains("not an earlier layer"));
+
+    // A source that is itself a consumer.
+    let mut bad = c.clone();
+    bad.layers[5].kv_source_layer = Some(4);
+    assert!(bad.validate().unwrap_err().contains("same shape"));
+
+    // A source with another head width (sliding layer 3 over full layer 2).
+    let mut bad = c.clone();
+    bad.layers[3].kv_source_layer = Some(2);
+    assert!(bad.validate().unwrap_err().contains("same shape"));
+
+    // A layout of the wrong length.
+    c.layers.pop();
+    assert!(c.validate().unwrap_err().contains("layer layout"));
 }
 
 // ---------------------------------------------------------------------------
 // Per-layer inputs (E2B / E4B)
 // ---------------------------------------------------------------------------
 
-fn ple() -> Config {
+fn ple() -> Case {
     let mut c = tiny();
     c.gemma.per_layer_input_size = 8;
     c
@@ -637,27 +754,31 @@ fn per_layer_input_is_built_from_tokens_and_embeddings() {
         ctx.inputs[0], "out:embedding",
         "projects the scaled embeddings"
     );
+    assert_eq!(ctx.shape, vec![4, 8]);
+    let scaled = r.node("layer1.ple_context_scale");
+    assert_eq!(attr_of(scaled, "kind"), Some(&Value::Text("scale".into())));
     assert_eq!(
-        attr_of(ctx, "output_scale"),
+        attr_of(scaled, "factor"),
         Some(&Value::Float(32f64.powf(-0.5)))
     );
-    assert_eq!(ctx.shape, vec![4, 8]);
+    assert_eq!(scaled.inputs, vec!["out:layer1.ple_context".to_string()]);
 
     let norm = r.node("layer1.ple_context_norm");
+    assert_eq!(norm.inputs[0], "out:layer1.ple_context_scale");
     assert_eq!(norm.inputs[1], "w:per_layer_projection_norm");
 
-    let mix = r.node("layer1.ple_mix");
+    let sum = r.node("layer1.ple_sum");
     assert_eq!(
-        mix.inputs,
+        sum.inputs,
         vec![
             "out:layer1.ple_context_norm".to_string(),
             "out:layer1.ple_token".to_string()
         ]
     );
-    assert_eq!(
-        attr_of(mix, "output_scale"),
-        Some(&Value::Float(0.5f64.sqrt()))
-    );
+    let mix = r.node("layer1.ple_mix");
+    assert_eq!(mix.inputs, vec!["out:layer1.ple_sum".to_string()]);
+    assert_eq!(attr_of(mix, "kind"), Some(&Value::Text("scale".into())));
+    assert_eq!(attr_of(mix, "factor"), Some(&Value::Float(0.5f64.sqrt())));
 }
 
 #[test]
@@ -733,7 +854,7 @@ fn e2b_style_config_builds_end_to_end() {
     let layers: Vec<_> = (0..35)
         .map(|i| if i % 5 == 4 { Full } else { Sliding })
         .collect();
-    let c = Config {
+    let c = Case {
         arch: Architecture {
             hidden_size: 1536,
             intermediate_size: 6144,
@@ -748,7 +869,7 @@ fn e2b_style_config_builds_end_to_end() {
             has_rope_scaling: false,
             moe: None,
         },
-        gemma: GemmaArchitecture {
+        gemma: HfGemma {
             layer_attention: layers,
             sliding_window: 512,
             global_head_dimension: 512,
@@ -781,7 +902,7 @@ fn e2b_style_config_builds_end_to_end() {
 // Mixture of experts (26B-A4B)
 // ---------------------------------------------------------------------------
 
-fn moe() -> Config {
+fn moe() -> Case {
     let mut c = tiny();
     c.arch.moe = Some(Moe {
         experts: 8,
@@ -830,6 +951,9 @@ fn moe_layer_runs_dense_mlp_and_routed_experts_side_by_side() {
             "w:layers.0.experts.gate_proj".to_string(),
             "w:layers.0.experts.up_proj".to_string(),
             "w:layers.0.experts.down_proj".to_string(),
+            // Applied by the Operator, never folded into (possibly
+            // quantized) expert weights.
+            "w:layers.0.experts.per_expert_scale".to_string(),
         ]
     );
     assert_eq!(attr_of(e, "experts"), Some(&Value::Int(8)));
@@ -878,8 +1002,8 @@ fn moe_layer_runs_dense_mlp_and_routed_experts_side_by_side() {
 fn moe_weight_names_follow_the_loader_contract() {
     let (r, _) = prefill(&moe(), 2, 0, 1);
     for w in [
-        "layers.0.router_norm",
         "layers.0.router_proj",
+        "layers.0.experts.per_expert_scale",
         "layers.0.pre_ffn_norm_2",
         "layers.0.post_ffn_norm_1",
         "layers.0.post_ffn_norm_2",
@@ -928,7 +1052,7 @@ fn real_gemma4_26b_a4b_shape_builds() {
     let layers: Vec<_> = (0..30)
         .map(|i| if i % 6 == 5 { Full } else { Sliding })
         .collect();
-    let c = Config {
+    let c = Case {
         arch: Architecture {
             hidden_size: 2816,
             intermediate_size: 2112,
@@ -949,7 +1073,7 @@ fn real_gemma4_26b_a4b_shape_builds() {
                 has_shared_expert: false,
             }),
         },
-        gemma: GemmaArchitecture {
+        gemma: HfGemma {
             layer_attention: layers,
             sliding_window: 1024,
             global_head_dimension: 512,
@@ -976,4 +1100,112 @@ fn real_gemma4_26b_a4b_shape_builds() {
             .count(),
         30
     );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime review: one scaling mechanism, no fabricated weights, no folding
+// of scales into possibly quantized weights
+// ---------------------------------------------------------------------------
+
+/// Every node of a full build of each variant.
+fn every_variant() -> Vec<Recorder> {
+    [tiny(), shared_kv(), ple(), moe()]
+        .iter()
+        .map(|c| prefill(c, 3, 0, 6).0)
+        .collect()
+}
+
+#[test]
+fn constants_are_applied_by_the_one_scale_operation() {
+    for r in every_variant() {
+        for n in &r.nodes {
+            assert!(attr_of(n, "output_scale").is_none(), "{}", n.id);
+            assert!(attr_of(n, "broadcast").is_none(), "{}", n.id);
+            if n.operator == "mul" {
+                assert_eq!(n.inputs.len(), 2);
+                assert!(!n.id.ends_with("layer_scalar"), "{}", n.id);
+            }
+        }
+    }
+    let (r, _) = prefill(&ple(), 3, 0, 6);
+    for id in ["layer0.ple_context_scale", "layer0.ple_mix"] {
+        let n = r.node(id);
+        assert_eq!((n.operator, n.family), ("activation", "Activation"), "{id}");
+        assert_eq!(
+            attr_of(n, "kind"),
+            Some(&Value::Text("scale".into())),
+            "{id}"
+        );
+        assert!(
+            matches!(attr_of(n, "factor"), Some(Value::Float(_))),
+            "{id}"
+        );
+        assert_eq!(n.inputs.len(), 1, "{id}");
+    }
+}
+
+#[test]
+fn layer_scalar_is_a_scale_with_a_weight_input() {
+    let (r, _) = prefill(&tiny(), 3, 0, 1);
+    let n = r.node("layer0.layer_scalar");
+    assert_eq!(n.operator, "activation");
+    assert_eq!(attr_of(n, "kind"), Some(&Value::Text("scale".into())));
+    assert!(attr_of(n, "factor").is_none(), "the factor is the input");
+    assert_eq!(
+        n.inputs,
+        vec![
+            "out:layer0.residual2".to_string(),
+            "w:layers.0.layer_scalar".to_string()
+        ]
+    );
+}
+
+#[test]
+fn scale_less_norms_take_one_input_and_request_no_weight() {
+    let (r, _) = prefill(&moe(), 3, 2, 3);
+    for id in ["layer2.v_norm", "layer2.router_norm"] {
+        let n = r.node(id);
+        assert_eq!(n.operator, "rmsnorm", "{id}");
+        assert_eq!(n.inputs.len(), 1, "{id}");
+        assert_eq!(attr_of(n, "with_scale"), Some(&Value::Bool(false)), "{id}");
+    }
+    // No unit vector is ever requested from the loader.
+    for w in &r.weights {
+        assert!(!w.ends_with("v_norm") && !w.ends_with("router_norm"), "{w}");
+    }
+    // Scaled norms keep their weight and no `with_scale` attribute.
+    assert_eq!(r.node("layer2.input_norm").inputs.len(), 2);
+    assert!(attr_of(r.node("layer2.input_norm"), "with_scale").is_none());
+    // The value norm is still per head.
+    assert_eq!(
+        attr_of(r.node("layer2.v_norm"), "head_dimension"),
+        Some(&Value::Int(16))
+    );
+}
+
+#[test]
+fn expert_scales_are_an_operator_input_not_folded_into_weights() {
+    let (r, _) = prefill(&moe(), 3, 0, 1);
+    let e = r.node("layer0.experts");
+    assert_eq!(e.inputs.len(), 6);
+    assert_eq!(e.inputs[4], "w:layers.0.experts.down_proj");
+    assert_eq!(e.inputs[5], "w:layers.0.experts.per_expert_scale");
+}
+
+#[test]
+fn the_component_names_no_model_family_in_its_layout_types() {
+    // `LayerSpec`/`Options` are what `model-config` carries; they must stay
+    // expressible without Gemma vocabulary (other families need them too).
+    let spec = LayerSpec {
+        sliding_window: None,
+        head_dimension: 64,
+        num_key_value_heads: 4,
+        rope_theta: 1e4,
+        partial_rotary_factor: None,
+        value_from_key: false,
+        kv_source_layer: None,
+        intermediate_size: 256,
+    };
+    assert_eq!(spec.clone(), spec);
+    assert!(Options::default().final_logit_softcapping.is_none());
 }

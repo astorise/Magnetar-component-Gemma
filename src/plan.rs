@@ -4,7 +4,7 @@
 //! Runtime-owned `graph-builder` Capability to [`GraphSink`], and the tests
 //! below drive the same code with a recording sink. Everything here is
 //! derived from the checkpoint's `config.json` values carried by
-//! `model-config` and `gemma-config`; nothing is a compiled-in dimension.
+//! `model-config`; nothing is a compiled-in dimension.
 //!
 //! Reference: Hugging Face `transformers` `modeling_gemma4.py`
 //! (`Gemma4TextDecoderLayer`, `Gemma4TextAttention`, `Gemma4ForCausalLM`).
@@ -112,38 +112,40 @@ pub struct Moe {
     pub has_shared_expert: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LayerAttention {
-    Sliding,
-    Full,
+/// `model-config.layer-spec`: one decoder layer's attention geometry. The
+/// Runtime derives it from the checkpoint; nothing here is Gemma-specific.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerSpec {
+    /// Look-back window in tokens; `None` attends over the whole context.
+    pub sliding_window: Option<u32>,
+    pub head_dimension: u64,
+    pub num_key_value_heads: u32,
+    pub rope_theta: f64,
+    /// Fraction of each head that rotates; `None` rotates all of it.
+    pub partial_rotary_factor: Option<f64>,
+    /// No V projection: V is K's raw projection.
+    pub value_from_key: bool,
+    /// Reuse the K/V of this earlier layer instead of computing them.
+    pub kv_source_layer: Option<u32>,
+    /// Dense feed-forward width of this layer.
+    pub intermediate_size: u64,
 }
 
-/// `gemma-config.gemma-architecture`.
-#[derive(Clone, Debug)]
-pub struct GemmaArchitecture {
-    pub layer_attention: Vec<LayerAttention>,
-    pub sliding_window: u32,
-    pub global_head_dimension: u64,
-    /// `None` when the checkpoint declares none (E2B/E4B): full layers then
-    /// keep `num_key_value_heads`.
-    pub num_global_key_value_heads: Option<u32>,
-    pub sliding_rope_theta: f64,
-    pub full_rope_theta: f64,
-    pub full_partial_rotary_factor: f64,
-    pub attention_k_eq_v: bool,
+/// `model-config.architecture-options`.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// `cap * tanh(logits / cap)` on the logits.
     pub final_logit_softcapping: Option<f64>,
-    /// `hidden_size_per_layer_input`; non-zero enables per-layer inputs.
+    /// Width of the per-layer inputs, `0` for none.
     pub per_layer_input_size: u32,
-    /// `num_kv_shared_layers`: trailing layers that reuse earlier K/V.
-    pub kv_shared_layers: u32,
-    /// `use_double_wide_mlp`: KV-sharing layers use `2 * intermediate_size`.
-    pub double_wide_mlp_on_shared_layers: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub arch: Architecture,
-    pub gemma: GemmaArchitecture,
+    /// One entry per decoder layer.
+    pub layers: Vec<LayerSpec>,
+    pub options: Options,
 }
 
 /// Where a layer's K/V come from.
@@ -151,18 +153,16 @@ pub struct Config {
 enum KvSource {
     /// The layer projects, normalizes and caches its own K/V.
     Own,
-    /// The layer attends over the K/V of an earlier layer of the same
-    /// attention flavour (`num_kv_shared_layers`) and has no K/V weights.
+    /// The layer attends over the K/V of an earlier layer and has no K/V
+    /// weights.
     Reuse { producer: u64 },
 }
 
-/// Geometry of one decoder layer, resolved from its attention flavour.
+/// Geometry of one decoder layer.
 #[derive(Clone, Debug, PartialEq)]
 struct Layer {
     index: u64,
     kv_source: KvSource,
-    /// Dense MLP width (doubled on shared-KV layers when
-    /// `use_double_wide_mlp`).
     intermediate_size: u64,
     head_dimension: u64,
     kv_heads: u64,
@@ -180,7 +180,7 @@ impl Config {
     /// graph for. The caller traps on `Err`: building a wrong graph would
     /// silently produce wrong logits.
     pub fn validate(&self) -> Result<(), String> {
-        let (a, g) = (&self.arch, &self.gemma);
+        let a = &self.arch;
         if a.has_rope_scaling {
             return Err(
                 "checkpoint declares RoPE frequency scaling, which Gemma 4 does not use".into(),
@@ -189,56 +189,50 @@ impl Config {
         if a.attention_bias {
             return Err("attention_bias = true is not a Gemma 4 configuration".into());
         }
-        if g.layer_attention.len() != a.num_hidden_layers as usize {
+        if self.layers.len() != a.num_hidden_layers as usize {
             return Err(format!(
-                "layer_types has {} entries for {} decoder layers",
-                g.layer_attention.len(),
+                "layer layout has {} entries for {} decoder layers",
+                self.layers.len(),
                 a.num_hidden_layers
             ));
         }
-        let any = |kind| g.layer_attention.contains(&kind);
-        if any(LayerAttention::Sliding) && g.sliding_window == 0 {
-            return Err("sliding layers declared with sliding_window = 0".into());
-        }
-        let mut kv_heads = vec![("num_key_value_heads", a.num_key_value_heads)];
-        if any(LayerAttention::Full) && g.attention_k_eq_v {
-            match g.num_global_key_value_heads {
-                Some(heads) => kv_heads.push(("num_global_key_value_heads", heads)),
-                None => {
-                    return Err(
-                        "attention_k_eq_v needs num_global_key_value_heads, which is absent".into(),
-                    );
-                }
+        for (index, l) in self.layers.iter().enumerate() {
+            if l.sliding_window == Some(0) {
+                return Err(format!("layer {index}: sliding window of 0 tokens"));
             }
-        }
-        for (what, heads) in kv_heads {
-            if heads == 0 || a.num_attention_heads % heads != 0 {
+            if l.head_dimension == 0 || l.intermediate_size == 0 {
+                return Err(format!("layer {index}: zero head or feed-forward width"));
+            }
+            let kv = l.num_key_value_heads;
+            if kv == 0 || !a.num_attention_heads.is_multiple_of(kv) {
                 return Err(format!(
-                    "{what} = {heads} does not divide num_attention_heads = {}",
+                    "layer {index}: {kv} KV heads do not divide {} attention heads",
                     a.num_attention_heads
                 ));
             }
-        }
-        if a.head_dimension == 0 || g.global_head_dimension == 0 {
-            return Err("head dimensions must be non-zero".into());
-        }
-        if !(g.full_partial_rotary_factor > 0.0 && g.full_partial_rotary_factor <= 1.0) {
-            return Err(format!(
-                "partial_rotary_factor {} is outside (0, 1]",
-                g.full_partial_rotary_factor
-            ));
-        }
-        if g.kv_shared_layers >= a.num_hidden_layers && g.kv_shared_layers != 0 {
-            return Err(format!(
-                "num_kv_shared_layers = {} leaves no layer that produces K/V",
-                g.kv_shared_layers
-            ));
-        }
-        for index in 0..a.num_hidden_layers as u64 {
-            if self.is_kv_consumer(index) && self.kv_producer(index).is_none() {
+            if let Some(f) = l.partial_rotary_factor
+                && !(f > 0.0 && f <= 1.0)
+            {
                 return Err(format!(
-                    "layer {index} reuses K/V but no earlier non-shared layer has its attention type"
+                    "layer {index}: partial rotary factor {f} is outside (0, 1]"
                 ));
+            }
+            if let Some(source) = l.kv_source_layer {
+                let source = source as usize;
+                let Some(producer) = self.layers.get(source).filter(|_| source < index) else {
+                    return Err(format!(
+                        "layer {index} reuses K/V of layer {source}, which is not an earlier layer"
+                    ));
+                };
+                if producer.kv_source_layer.is_some()
+                    || producer.head_dimension != l.head_dimension
+                    || producer.num_key_value_heads != l.num_key_value_heads
+                {
+                    return Err(format!(
+                        "layer {index} reuses K/V of layer {source}, which does not produce \
+                         K/V of the same shape"
+                    ));
+                }
             }
         }
         if let Some(moe) = &a.moe {
@@ -264,68 +258,23 @@ impl Config {
         Ok(())
     }
 
-    fn first_kv_shared_layer(&self) -> u64 {
-        (self.arch.num_hidden_layers - self.gemma.kv_shared_layers) as u64
-    }
-
-    fn is_kv_consumer(&self, index: u64) -> bool {
-        self.gemma.kv_shared_layers != 0 && index >= self.first_kv_shared_layer()
-    }
-
-    /// The layer whose K/V a consumer attends over: the last non-shared
-    /// layer of the same attention flavour (`kv_sharing_modes`).
-    fn kv_producer(&self, index: u64) -> Option<u64> {
-        if !self.is_kv_consumer(index) {
-            return None;
-        }
-        let kind = self.gemma.layer_attention[index as usize];
-        (0..self.first_kv_shared_layer())
-            .rev()
-            .find(|i| self.gemma.layer_attention[*i as usize] == kind)
-    }
-
     fn layer(&self, index: u64) -> Layer {
-        let (a, g) = (&self.arch, &self.gemma);
-        let consumer = self.is_kv_consumer(index);
-        let kv_source = match self.kv_producer(index) {
-            Some(producer) => KvSource::Reuse { producer },
-            None => KvSource::Own,
-        };
-        let intermediate_size = a.intermediate_size
-            * if consumer && g.double_wide_mlp_on_shared_layers {
-                2
-            } else {
-                1
-            };
-        match g.layer_attention[index as usize] {
-            LayerAttention::Sliding => Layer {
-                index,
-                kv_source,
-                intermediate_size,
-                head_dimension: a.head_dimension,
-                kv_heads: a.num_key_value_heads as u64,
-                window: Some(g.sliding_window as u64),
-                rope_theta: g.sliding_rope_theta,
-                partial_rotary_factor: None,
-                k_eq_v: false,
-            },
-            LayerAttention::Full => Layer {
-                index,
-                kv_source,
-                intermediate_size,
-                head_dimension: g.global_head_dimension,
-                // `per_layer_config` only overrides the KV head count of
-                // full layers when `attention_k_eq_v` is set.
-                kv_heads: match (g.attention_k_eq_v, g.num_global_key_value_heads) {
-                    (true, Some(global)) => global as u64,
-                    _ => a.num_key_value_heads as u64,
+        let l = &self.layers[index as usize];
+        Layer {
+            index,
+            kv_source: match l.kv_source_layer {
+                Some(producer) => KvSource::Reuse {
+                    producer: producer as u64,
                 },
-                window: None,
-                rope_theta: g.full_rope_theta,
-                partial_rotary_factor: (g.full_partial_rotary_factor < 1.0)
-                    .then_some(g.full_partial_rotary_factor),
-                k_eq_v: g.attention_k_eq_v,
+                None => KvSource::Own,
             },
+            intermediate_size: l.intermediate_size,
+            head_dimension: l.head_dimension,
+            kv_heads: l.num_key_value_heads as u64,
+            window: l.sliding_window.map(u64::from),
+            rope_theta: l.rope_theta,
+            partial_rotary_factor: l.partial_rotary_factor.filter(|f| *f < 1.0),
+            k_eq_v: l.value_from_key,
         }
     }
 }
@@ -340,16 +289,13 @@ fn tensor_parallel(kind: &str) -> Attr {
 
 /// Canonical Model Artifact tensor name for a per-layer weight.
 ///
-/// Several names are *derived* from checkpoint tensors by the loader (see the
-/// requirements document): `router_proj` (router weight with the router
-/// `scale * hidden_size^-0.5` folded in), `router_norm` and `v_norm` (unit
-/// vectors), `experts_*_proj` (the stacked, `gate_up_proj`-split expert
-/// weights, `down` with `per_expert_scale` folded in) and the
-/// `per_layer_embedding` / `per_layer_model_projection` per-layer slices.
-///
-/// `v_norm` has no checkpoint tensor (`Gemma4RMSNorm(with_scale=False)`): the
-/// Model Artifact loader must resolve it to a unit-scale vector so the
-/// portable two-input `rmsnorm` Operator stays valid.
+/// Every name is a checkpoint tensor, possibly re-laid-out by the loader
+/// (stacked experts, per-layer slices, `router_proj` with the router
+/// `scale * hidden_size^-0.5` folded in, as routers stay in float). The two
+/// scale-less norms (`v_norm`, the router's) have no tensor at all and are
+/// expressed as `rmsnorm` with `with_scale = false`; `per_expert_scale` stays
+/// a separate input of `moe-experts`, so quantized expert weights are never
+/// rewritten.
 pub fn weight_name(layer: u64, suffix: &str) -> String {
     match suffix {
         "input_norm"
@@ -361,7 +307,6 @@ pub fn weight_name(layer: u64, suffix: &str) -> String {
         | "pre_ffn_norm_2"
         | "post_ffn_norm_1"
         | "post_ffn_norm_2"
-        | "router_norm"
         | "router_proj"
         // Per-layer inputs (E2B/E4B).
         | "per_layer_input_gate"
@@ -369,10 +314,13 @@ pub fn weight_name(layer: u64, suffix: &str) -> String {
         | "post_per_layer_input_norm"
         | "per_layer_embedding"
         | "per_layer_model_projection" => format!("layers.{layer}.{suffix}"),
-        "experts_gate_proj" | "experts_up_proj" | "experts_down_proj" => {
+        "experts_gate_proj"
+        | "experts_up_proj"
+        | "experts_down_proj"
+        | "experts_per_expert_scale" => {
             format!("layers.{layer}.experts.{}", &suffix["experts_".len()..])
         }
-        "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_norm" | "k_norm" | "v_norm" => {
+        "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_norm" | "k_norm" => {
             format!("layers.{layer}.self_attn.{suffix}")
         }
         "gate_proj" | "up_proj" | "down_proj" => format!("layers.{layer}.mlp.{suffix}"),
@@ -526,22 +474,20 @@ impl<S: GraphSink> Builder<'_, S> {
         }
     }
 
-    fn scaled_matmul(
-        &mut self,
-        id: String,
-        x: &str,
-        weight: &str,
-        out_dim: u64,
-        output_scale: f64,
-    ) -> String {
-        let w = self.sink.weight_edge(weight);
+    /// The single scaling mechanism: `activation{kind = "scale", factor}`
+    /// multiplies by a constant; given a second input it multiplies by that
+    /// input instead (`layer_scalar`, shape `[1]`).
+    fn scale(&mut self, id: String, x: &str, factor: f64, width: u64) -> String {
         self.node(
             id,
-            "matmul",
-            "LinearAlgebra",
-            vec![attr("output_scale", Value::Float(output_scale))],
-            vec![x.into(), w],
-            vec![self.seq, out_dim],
+            "activation",
+            "Activation",
+            vec![
+                attr("kind", Value::Text("scale".into())),
+                attr("factor", Value::Float(factor)),
+            ],
+            vec![x.into()],
+            vec![self.seq, width],
             None,
         )
     }
@@ -607,17 +553,17 @@ impl<S: GraphSink> Builder<'_, S> {
         let k_kv = self.kv(layer.index, KvRole::K);
         let k = self.rope(format!("{p}.rope_k"), &k, layer, layer.kv_heads, Some(k_kv));
         let v_kv = self.kv(layer.index, KvRole::V);
-        let v_scale = self.sink.weight_edge(&weight_name(layer.index, "v_norm"));
         let v = self.node(
             format!("{p}.v_norm"),
             "rmsnorm",
             "Normalization",
             vec![
                 self.eps(),
+                attr("with_scale", Value::Bool(false)),
                 attr("head_count", Value::Int(layer.kv_heads as i64)),
                 attr("head_dimension", Value::Int(hd as i64)),
             ],
-            vec![v_raw, v_scale],
+            vec![v_raw],
             vec![self.seq, kv_dim],
             Some(v_kv),
         );
@@ -690,10 +636,14 @@ impl<S: GraphSink> Builder<'_, S> {
         // Router: score the *un-normalized* residual stream through a
         // scale-less RMSNorm and a projection into which the loader folds
         // `router.scale * hidden_size^-0.5`.
-        let routed_in = self.hidden_norm(
+        let routed_in = self.node(
             format!("{p}.router_norm"),
-            h,
-            &weight_name(layer.index, "router_norm"),
+            "rmsnorm",
+            "Normalization",
+            vec![self.eps(), attr("with_scale", Value::Bool(false))],
+            vec![h.into()],
+            vec![self.seq, hidden],
+            None,
         );
         let scores = self.matmul(
             format!("{p}.router"),
@@ -716,6 +666,9 @@ impl<S: GraphSink> Builder<'_, S> {
         let down_w = self
             .sink
             .weight_edge(&weight_name(layer.index, "experts_down_proj"));
+        let per_expert = self
+            .sink
+            .weight_edge(&weight_name(layer.index, "experts_per_expert_scale"));
         let routed = self.node(
             format!("{p}.experts"),
             "moe-experts",
@@ -727,7 +680,7 @@ impl<S: GraphSink> Builder<'_, S> {
                 attr("activation", Value::Text("gelu_tanh".into())),
                 tensor_parallel("experts"),
             ],
-            vec![experts_in, scores, gate, up, down_w],
+            vec![experts_in, scores, gate, up, down_w, per_expert],
             vec![self.seq, hidden],
             None,
         );
@@ -756,7 +709,7 @@ impl<S: GraphSink> Builder<'_, S> {
     /// `(norm(embeddings @ projection_i * hidden^-0.5) + embed_i(token_ids) * sqrt(P)) * 2^-0.5`.
     fn per_layer_input(&mut self, layer: u64) -> String {
         let p = format!("layer{layer}");
-        let width = self.cfg.gemma.per_layer_input_size as u64;
+        let width = self.cfg.options.per_layer_input_size as u64;
         let hidden = self.cfg.arch.hidden_size as f64;
         let token_ids = self
             .token_ids
@@ -778,12 +731,18 @@ impl<S: GraphSink> Builder<'_, S> {
             vec![self.seq, width],
             None,
         );
-        let context = self.scaled_matmul(
+        let context = self.matmul(
             format!("{p}.ple_context"),
             &embeddings,
             &weight_name(layer, "per_layer_model_projection"),
             width,
+            None,
+        );
+        let context = self.scale(
+            format!("{p}.ple_context_scale"),
+            &context,
             hidden.powf(-0.5),
+            width,
         );
         let norm_w = self.sink.weight_edge("per_layer_projection_norm");
         let context = self.node(
@@ -795,22 +754,23 @@ impl<S: GraphSink> Builder<'_, S> {
             vec![self.seq, width],
             None,
         );
-        self.node(
-            format!("{p}.ple_mix"),
+        let sum = self.node(
+            format!("{p}.ple_sum"),
             "add",
             "Tensor",
-            vec![attr("output_scale", Value::Float(0.5f64.sqrt()))],
+            vec![],
             vec![context, token_part],
             vec![self.seq, width],
             None,
-        )
+        );
+        self.scale(format!("{p}.ple_mix"), &sum, 0.5f64.sqrt(), width)
     }
 
     /// Gemma 4 E2B/E4B: gate the hidden state, modulate it with the layer's
     /// per-layer input, project back and add it as a normalized residual.
     fn per_layer_tail(&mut self, layer: u64, x: &str) -> String {
         let p = format!("layer{layer}");
-        let width = self.cfg.gemma.per_layer_input_size as u64;
+        let width = self.cfg.options.per_layer_input_size as u64;
         let hidden = self.cfg.arch.hidden_size;
         let input = self.per_layer_input(layer);
         let gated = self.matmul(
@@ -917,7 +877,7 @@ impl<S: GraphSink> Builder<'_, S> {
         let mut out = self.residual(format!("{p}.residual2"), &h, &ffn);
 
         // --- per-layer input (E2B/E4B) -------------------------------------
-        if self.cfg.gemma.per_layer_input_size != 0 {
+        if self.cfg.options.per_layer_input_size != 0 {
             out = self.per_layer_tail(layer.index, &out);
         }
 
@@ -927,9 +887,9 @@ impl<S: GraphSink> Builder<'_, S> {
             .weight_edge(&weight_name(layer.index, "layer_scalar"));
         self.node(
             format!("{p}.layer_scalar"),
-            "mul",
-            "Tensor",
-            vec![attr("broadcast", Value::Text("scalar".into()))],
+            "activation",
+            "Activation",
+            vec![attr("kind", Value::Text("scale".into()))],
             vec![out, scalar],
             vec![self.seq, a.hidden_size],
             None,
@@ -981,7 +941,7 @@ pub fn build_graph_segment<S: GraphSink>(sink: &mut S, cfg: &Config, segment: Se
         token_ids: None,
         embeddings: None,
     };
-    let per_layer_inputs = cfg.gemma.per_layer_input_size != 0;
+    let per_layer_inputs = cfg.options.per_layer_input_size != 0;
     for index in start_layer as u64..end_layer as u64 {
         if let KvSource::Reuse { producer } = cfg.layer(index).kv_source {
             assert!(
@@ -1050,7 +1010,7 @@ pub fn build_graph_segment<S: GraphSink>(sink: &mut S, cfg: &Config, segment: Se
         vec![sequence_length, a.vocabulary_size],
         None,
     );
-    if let Some(cap) = cfg.gemma.final_logit_softcapping {
+    if let Some(cap) = cfg.options.final_logit_softcapping {
         // logits = cap * tanh(logits / cap)
         logits = b.node(
             "logit_softcap".into(),

@@ -1,16 +1,15 @@
-//! WIT adapter: `graph-builder` -> [`GraphSink`], `model-config` and
-//! `gemma-config` -> [`Config`], and the Component exports.
+//! WIT adapter: `graph-builder` -> [`GraphSink`], `model-config` ->
+//! [`Config`], and the Component exports.
 
 wit_bindgen::generate!({
     path: "wit/model-component-graph.wit",
-    world: "gemma-model-component-producer",
+    world: "model-component-graph-producer",
 });
 
 use crate::plan::{
-    self, Architecture, Attr, Config, GemmaArchitecture, GraphSink, KvRole, LayerAttention, Moe,
-    Node, Phase, Segment, Value,
+    self, Architecture, Attr, Config, GraphSink, KvRole, LayerSpec, Moe, Node, Options, Phase,
+    Segment, Value,
 };
-use magnetar::model_component_graph::gemma_config::{self, LayerAttention as WitLayer};
 use magnetar::model_component_graph::graph_builder as gb;
 use magnetar::model_component_graph::model_config;
 
@@ -94,7 +93,11 @@ fn wit_attr(attr: &Attr) -> gb::Attribute {
 /// Capabilities: no dimension is cached or compiled in.
 fn load_config() -> Config {
     let a = model_config::model_config();
-    let g = gemma_config::architecture();
+    // A Gemma graph needs the per-layer layout; a Runtime that has none for
+    // the active Model Instance cannot be served by this Component.
+    let layout = model_config::layer_layout()
+        .expect("gemma: the Runtime supplied no per-layer layout for this Model Instance");
+    let options = model_config::options();
     Config {
         arch: Architecture {
             hidden_size: a.hidden_size,
@@ -116,26 +119,22 @@ fn load_config() -> Config {
                 has_shared_expert: m.shared_expert_intermediate_size.is_some(),
             }),
         },
-        gemma: GemmaArchitecture {
-            layer_attention: g
-                .layer_attention
-                .iter()
-                .map(|l| match l {
-                    WitLayer::Sliding => LayerAttention::Sliding,
-                    WitLayer::Full => LayerAttention::Full,
-                })
-                .collect(),
-            sliding_window: g.sliding_window,
-            global_head_dimension: g.global_head_dimension,
-            num_global_key_value_heads: g.num_global_key_value_heads,
-            sliding_rope_theta: g.sliding_rope_theta,
-            full_rope_theta: g.full_rope_theta,
-            full_partial_rotary_factor: g.full_partial_rotary_factor,
-            attention_k_eq_v: g.attention_k_eq_v,
-            final_logit_softcapping: g.final_logit_softcapping,
-            per_layer_input_size: g.per_layer_input_size,
-            kv_shared_layers: g.kv_shared_layers,
-            double_wide_mlp_on_shared_layers: g.double_wide_mlp_on_shared_layers,
+        layers: layout
+            .into_iter()
+            .map(|l| LayerSpec {
+                sliding_window: l.sliding_window,
+                head_dimension: l.head_dimension,
+                num_key_value_heads: l.num_key_value_heads,
+                rope_theta: l.rope_theta,
+                partial_rotary_factor: l.partial_rotary_factor,
+                value_from_key: l.value_from_key,
+                kv_source_layer: l.kv_source_layer,
+                intermediate_size: l.intermediate_size,
+            })
+            .collect(),
+        options: Options {
+            final_logit_softcapping: options.final_logit_softcapping,
+            per_layer_input_size: options.per_layer_input_size,
         },
     }
 }

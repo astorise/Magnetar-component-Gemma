@@ -80,42 +80,51 @@ Verified against `transformers`' `modeling_gemma4.py` and the checkpoints'
 
 ## Governing contract
 
-Targets `magnetar:model-component-graph`, world `gemma-model-component-producer`
+Targets `magnetar:model-component-graph`, world `model-component-graph-producer`
 (`wit/model-component-graph.wit`, version **1.6.0**): the `1.5.0`
-`graph-builder` and `model-config` interfaces unchanged, plus one new additive
-interface, `gemma-config`, carrying what `architecture-config` cannot (per-layer
-attention kind, sliding window, global head width and KV heads, per-flavour
-RoPE bases, partial rotary factor, K=V, logit soft-capping, and the fields that
-whether per-layer inputs, shared KV and its wider MLP apply). Component exports are the
-same four as `components/qwen` and `components/llama`.
+`graph-builder` and `model-config` interfaces unchanged, plus a **family-neutral,
+additive** extension of `model-config` (nothing in it names Gemma, and the
+Component imports no interface of its own):
+
+- `layer-layout() -> option<list<layer-spec>>`: per decoder layer, the sliding
+  window, head width, KV head count, RoPE base, partial rotary factor,
+  value-from-key, the earlier layer whose K/V it reuses, and its feed-forward
+  width. The Runtime derives every field from the checkpoint; the Component
+  only validates the layout and never re-implements a per-layer rule.
+- `options() -> architecture-options`: logit soft-capping and the per-layer
+  input width.
+
+Exports are the same four as `components/qwen` and `components/llama`.
 
 Weight logical names follow `components/llama` (`layers.N.self_attn.q_proj`,
-`layers.N.mlp.gate_proj`, ...) plus `q_norm`, `k_norm`, `v_norm`,
-`pre_ffn_norm`, `post_ffn_norm`, `layer_scalar` per layer.
+`layers.N.mlp.gate_proj`, ...) plus `q_norm`, `k_norm`, `pre_ffn_norm`,
+`post_ffn_norm`, `layer_scalar` per layer; MoE and per-layer-input names are
+listed in the requirements document.
 
 ## Runtime prerequisites
 
 None of these exist in Magnetar `main` today; each is rejected fail-closed
 until added, so this Component cannot silently misbehave against an older
 Runtime. They are tracked in
-[astorise/Magnetar#187](https://github.com/astorise/Magnetar/issues/187) and
-detailed in [`docs/magnetar-runtime-requirements.md`](docs/magnetar-runtime-requirements.md).
+[astorise/Magnetar#187](https://github.com/astorise/Magnetar/issues/187), where
+the Runtime team has reviewed them, and detailed in
+[`docs/magnetar-runtime-requirements.md`](docs/magnetar-runtime-requirements.md).
 
-1. **WIT `1.6.0`** with `gemma-config`, populated from the checkpoint's text
-   config.
-2. **Operator attributes** the portable Operators do not yet accept:
-   `embedding.scale`; `attention.scale`; `rope.partial_rotary_factor`;
-   `gelu.approximate = "tanh"`; per-head `rmsnorm`; `mul` with
-   `broadcast = "scalar"`; `matmul`/`add` `output_scale`;
-   `moe-experts.activation = "gelu_tanh"`; and an `activation` of
-   `kind = "softcap"`. `attention.window_size`, `gelu` and `moe-experts`
-   already exist.
-3. **Loader**: map the checkpoint's `model.language_model.*` tensors to the
-   logical names, and *derive* the ones the checkpoint does not contain as
-   such (unit-scale `v_norm`/`router_norm`; router weight with
-   `scale * hidden^-0.5` folded in; experts split from `gate_up_proj` with
-   `per_expert_scale` folded into `down`; per-layer slices of the packed
-   per-layer embedding and projection).
+1. **WIT `1.6.0`**: `model-config.layer-layout` and `options`, filled from the
+   checkpoint.
+2. **Operator attributes**: `embedding.scale`; `attention.scale`;
+   `rope.partial_rotary_factor`; `gelu.approximate = "tanh"`; `rmsnorm`
+   per-head (`head_count`, `head_dimension`) and scale-less
+   (`with_scale = false`, one input); `moe-experts.activation = "gelu_tanh"` and
+   a sixth `per_expert_scale` input; and `activation` of `kind = "softcap"`
+   (`cap`) and `kind = "scale"` (`factor`, or a second input for
+   `layer_scalar`). `attention.window_size`, `gelu` and `moe-experts` already
+   exist.
+3. **Loader**: map the checkpoint's tensors (Hugging Face
+   `model.language_model.*` or GGUF `gemma4`) to the logical names. No weight
+   is fabricated and no scale is folded into a weight that may be quantized;
+   the only derivation is the router's `scale * hidden^-0.5` folded into the
+   float `router_proj`.
 
 ## Verification
 

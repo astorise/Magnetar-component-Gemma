@@ -217,64 +217,52 @@ interface model-config {
   /// build a dense one. A new function, not a new `architecture-config`
   /// field, so Components compiled against earlier versions keep linking.
   mixture-of-experts: func() -> option<moe-config>;
-}
 
-/// Gemma-family architecture facts `architecture-config` cannot carry.
-/// Added in `1.6.0`, purely additive: `graph-builder` and `model-config`
-/// are unchanged, and only the `gemma-model-component-producer` world below
-/// imports this interface, so every other Component keeps linking.
-///
-/// Values mirror the checkpoint's text `config.json` (Gemma 4 names in
-/// parentheses). A Runtime that cannot supply a value must trap rather than
-/// invent one.
-interface gemma-config {
-  /// Attention flavour of one decoder layer (`layer_types`).
-  enum layer-attention {
-    /// `sliding_attention`: causal, limited to the last `sliding-window`
-    /// positions, local RoPE base, `head-dimension` wide heads.
-    sliding,
-    /// `full_attention`: causal over the whole context, global RoPE base,
-    /// `global-head-dimension` wide heads, `num-global-key-value-heads` KV
-    /// heads.
-    full,
+  /// One decoder layer's attention and feed-forward geometry. Added in
+  /// `1.6.0`. Family-neutral: it describes what differs *between layers* of a
+  /// checkpoint (sliding vs. full attention, head widths, KV head counts,
+  /// RoPE per attention kind, shared KV, feed-forward width), not any model
+  /// family. The Runtime derives every field from the checkpoint's
+  /// configuration; a Component never recomputes a per-layer rule.
+  record layer-spec {
+    /// Look-back window in tokens; `none` attends over the whole context.
+    sliding-window: option<u32>,
+    /// Width of one attention head in this layer.
+    head-dimension: u64,
+    /// Key/value heads in this layer.
+    num-key-value-heads: u32,
+    /// RoPE base of this layer.
+    rope-theta: f64,
+    /// Fraction of each head that is rotated, the rest staying
+    /// position-independent; `none` rotates the whole head.
+    partial-rotary-factor: option<f64>,
+    /// The layer has no value projection: V is derived from the raw key
+    /// projection.
+    value-from-key: bool,
+    /// The layer computes no K/V of its own and attends over those of this
+    /// earlier layer, which must have the same head width and KV head count.
+    kv-source-layer: option<u32>,
+    /// Width of the layer's dense feed-forward.
+    intermediate-size: u64,
   }
 
-  record gemma-architecture {
-    /// One entry per decoder layer, `num-hidden-layers` long (`layer_types`).
-    layer-attention: list<layer-attention>,
-    /// Look-back window of sliding layers, in tokens (`sliding_window`).
-    sliding-window: u32,
-    /// Head width of full-attention layers (`global_head_dim`).
-    global-head-dimension: u64,
-    /// KV head count of full-attention layers (`num_global_key_value_heads`);
-    /// `none` when the checkpoint declares none (E2B/E4B), in which case
-    /// full layers keep `num-key-value-heads`.
-    num-global-key-value-heads: option<u32>,
-    /// RoPE base of sliding layers (`rope_parameters.sliding_attention`).
-    sliding-rope-theta: f64,
-    /// RoPE base of full-attention layers (`rope_parameters.full_attention`).
-    full-rope-theta: f64,
-    /// Share of a full-attention head that is rotated; the rest keeps
-    /// position-independent (`partial_rotary_factor`, 1.0 when absent).
-    full-partial-rotary-factor: f64,
-    /// Full-attention layers have no V projection: V is K's raw projection
-    /// (`attention_k_eq_v`).
-    attention-k-eq-v: bool,
-    /// `cap * tanh(logits / cap)` applied to the logits
-    /// (`final_logit_softcapping`).
+  /// Added in `1.6.0`: one `layer-spec` per decoder layer
+  /// (`num-hidden-layers` entries), `none` for a checkpoint whose layers are
+  /// uniform and fully described by `architecture-config`. A Component that
+  /// needs a layout and gets `none` must refuse to build a graph.
+  layer-layout: func() -> option<list<layer-spec>>;
+
+  /// Checkpoint-wide options `architecture-config` cannot carry. Added in
+  /// `1.6.0`.
+  record architecture-options {
+    /// `cap * tanh(logits / cap)` applied to the logits.
     final-logit-softcapping: option<f64>,
-    /// Width of the per-layer input embeddings, `0` for none
-    /// (`hidden_size_per_layer_input`; Gemma 4 E2B/E4B).
+    /// Width of the per-layer input embeddings, `0` for none. A Component
+    /// that does not implement them must refuse to build a graph.
     per-layer-input-size: u32,
-    /// Trailing layers that reuse K/V computed by an earlier layer of the same
-    /// attention kind, `0` for none (`num_kv_shared_layers`).
-    kv-shared-layers: u32,
-    /// Layers that reuse K/V have a feed-forward twice as wide
-    /// (`use_double_wide_mlp`).
-    double-wide-mlp-on-shared-layers: bool,
   }
 
-  architecture: func() -> gemma-architecture;
+  options: func() -> architecture-options;
 }
 
 /// World a Model Component satisfies to produce graphs through this
@@ -326,18 +314,5 @@ world model-component-graph-producer {
   /// `build-decode-graph(cached-token-count)` is exactly
   /// `build-decode-graph-segment(cached-token-count, 0,
   /// num-hidden-layers)`.
-  export build-decode-graph-segment: func(cached-token-count: u64, start-layer: u32, end-layer: u32) -> string;
-}
-
-/// The world the Gemma Component satisfies: `model-component-graph-producer`
-/// plus `gemma-config`. Exports are identical.
-world gemma-model-component-producer {
-  import graph-builder;
-  import model-config;
-  import gemma-config;
-
-  export build-prefill-graph: func(sequence-length: u64) -> string;
-  export build-decode-graph: func(cached-token-count: u64) -> string;
-  export build-prefill-graph-segment: func(sequence-length: u64, start-layer: u32, end-layer: u32) -> string;
   export build-decode-graph-segment: func(cached-token-count: u64, start-layer: u32, end-layer: u32) -> string;
 }
