@@ -5,7 +5,7 @@ name = "magnetar-component-gemma"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Google Gemma model Component (WebAssembly) template for the Magnetar inference runtime."
+description = "Google Gemma 4 model Component (WebAssembly) for the Magnetar inference runtime."
 repository = "https://github.com/astorise/Magnetar-component-Gemma"
 readme = "README.md"
 keywords = ["ai", "inference", "magnetar"]
@@ -15,4 +15,9 @@ rust-version = "1.98"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Generate and compile the WIT bindings on native targets (always on for wasm32).
+bindings = []
+
 [dependencies]
+wit-bindgen = "0.63"
