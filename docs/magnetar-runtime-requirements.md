@@ -140,7 +140,7 @@ Un segment doit contenir les producteurs de ses couches partagées (trap sinon).
 1. Le Component link et s'instancie sous Wasmtime avec `graph-builder` et `model-config` en `1.6.0`. **Vérifié** sur `84093cb` (voir `docs/engine-smoke-test`).
 2. Les graphes du 31B, du 26B-A4B et d'un E2B passent la validation Runtime sans attribut rejeté. **Vérifié** aux formes réelles (formes seules, sans poids) : 1314, 869 et 1094 nœuds.
 3. Conformité Reference CPU, avec fixtures, de : `softcap`, `scale`, `rmsnorm` par tête et sans échelle, `rope` partiel, `attention` avec `scale` et `window_size`, `gelu` tanh, `moe-experts` avec `per_expert_scale` et `gelu_tanh`.
-4. Logits comparés à `transformers`. **Fait sur de petits checkpoints aléatoires** de même format (`tools/qualification`) : denses et à KV partagé, écart ≤ 5,5e-5, avec un correctif local du Runtime (voir ci-dessous). **Non fait** : per-layer inputs et MoE (loaders), et les checkpoints réels (31B, 26B-A4B, E2B).
+4. Logits comparés à `transformers`. **Fait sur de petits checkpoints aléatoires** de même format (`tools/qualification`), sur Magnetar `1f21bd7` sans patch : dense, KV partagé, per-layer inputs et MoE, écart ≤ 5,5e-5, tokens identiques. **Non fait** : les checkpoints réels (31B, 26B-A4B, E2B) et le GGUF quantifié.
 5. Variantes quantifiées : même comparaison sur un export GGUF.
 
 ## 6 bis. Écarts du chemin « production » trouvés par la comparaison (corrigés)

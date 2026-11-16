@@ -22,19 +22,19 @@ feeds both sides.
 | `run_logit_comparison.sh` | runs all of it |
 
 ```bash
-MAGNETAR_DIR=/path/to/magnetar CARGO_FLAGS=--ignore-rust-version \
-  tools/qualification/run_logit_comparison.sh dense shared
+SKIP_RUNTIME_PATCH=1 MAGNETAR_DIR=/path/to/magnetar CARGO_FLAGS=--ignore-rust-version \
+  tools/qualification/run_logit_comparison.sh dense shared ple moe
 ```
 
-It needs a Magnetar checkout (`84093cb` with the patch, or the branch above) whose `loaders/huggingface` and
+It needs a Magnetar checkout (`1f21bd7` or later, or `84093cb` with the patch) whose `loaders/huggingface` and
 `formats/safetensors` submodules are populated, `wasm-tools`, and Python with
 torch (CPU), `transformers` 5.x, `safetensors` and `numpy`.
 
 ## Results
 
-Magnetar branch `claude/charming-lamport-1b9m74` (`3a0593a`, not merged yet),
-**no local patch**; the same numbers were obtained on `84093cb` plus the patch
-described at the end.
+Magnetar `main` at `1f21bd7` (#197 fixes the production path, #199 pins the
+loaders that slice per-layer tables and restack experts), with
+`loaders/huggingface` at `4274211`, **no local patch**.
 
 Prompt `[5, 17, 33, 8, 41, 2, 60, 12]`, 12 greedy tokens (one prefill, eleven
 decode steps with a KV cache), Reference CPU, f32, tolerance 1e-3 on the top 8
@@ -44,6 +44,8 @@ logits and identical tokens required:
 |---|---|---|---|
 | `dense` | sliding and full layers, 16- and 32-wide heads, K=V, "proportional" partial RoPE, q/k/v norms, sandwich norms, `layer_scalar`, GeGLU, soft-cap | identical | 3.5e-5 |
 | `shared` | the above, plus the last 3 layers reusing K/V and a twice-as-wide MLP | identical | 5.5e-5 |
+| `ple` | shared KV plus per-layer inputs (sliced embedding and projection tables) | identical | 4.9e-5 |
+| `moe` | dense MLP and 8 routed experts (top-2) side by side, router, `per_expert_scale` | identical | 1.8e-5 |
 
 Logits are of order 10, so these are float32 rounding differences.
 
@@ -59,20 +61,18 @@ Logits are of order 10, so these are float32 rounding differences.
 
 ## Not run
 
-- `ple` (per-layer inputs) and `moe` (routed experts): the references are
-  produced, but Magnetar's Hugging Face loader refuses these bundles for now
-  (*"packs every layer's per-layer input weights into one table ... does not
-  slice per layer yet"*, *"routed experts ... does not restack yet"*). The same
-  commands run them once the loader transforms exist.
-- The real checkpoints. Only the tiny random ones above were run; 31B needs
+- The real checkpoints. Only the tiny random ones above were run; the 31B needs
   about 60 GB of weights. The comparison on real weights (and on a quantized
-  GGUF) is still to do.
+  GGUF, `Q4_0` is not decoded yet) is still to do.
+- Several of the checked mechanisms only exist at tiny sizes here (6 layers,
+  64 hidden, 8 experts); the 128-expert router and 512-wide heads were only
+  checked for graph acceptance (`docs/engine-smoke-test`), not numerically.
 - CUDA, other Providers, and the decode-step replay path.
 
 ## The local Runtime patch (no longer needed)
 
-The Runtime fixed these on `claude/charming-lamport-1b9m74`; run the script with
-`SKIP_RUNTIME_PATCH=1` there. Without the patch or that fix, Magnetar `84093cb` cannot run these models through its production
+The Runtime fixed these (merged as #197); run the script with
+`SKIP_RUNTIME_PATCH=1`. Without the patch or that fix, Magnetar `84093cb` cannot run these models through its production
 path at all (the bundle ingests, then loading fails). Three places still assume
 Qwen's tensor inventory; the patch changes only them, and it is a diagnostic, not
 a proposal for how Magnetar should fix them:
