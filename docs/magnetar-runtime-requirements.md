@@ -6,7 +6,7 @@ Références : `modeling_gemma4.py` de `transformers`, `config.json` des checkpo
 
 Cette version intègre la revue du Runtime sur #187 : plus d'interface ni de monde nommés Gemma, un seul mécanisme de mise à l'échelle, aucun poids fabriqué par le loader, aucun facteur replié dans un poids potentiellement quantifié.
 
-Le Component construit les graphes de tous les décodeurs texte Gemma 4 : dense (31B, 12B), MoE (26B-A4B), E2B/E4B (per-layer inputs, KV partagé). Tant que les points ci-dessous manquent, il est rejeté explicitement (échec de link, d'attribut ou de validation), sans repli silencieux.
+Le Component construit les graphes de tous les décodeurs texte Gemma 4 : dense (31B ; le 12B déclare `gemma4_unified`, non mappé par les loaders), MoE (26B-A4B), E2B/E4B (per-layer inputs, KV partagé). Tant que les points ci-dessous manquent, il est rejeté explicitement (échec de link, d'attribut ou de validation), sans repli silencieux.
 
 ## 1. WIT `1.6.0` : extension neutre de `model-config`
 
@@ -137,8 +137,8 @@ Un segment doit contenir les producteurs de ses couches partagées (trap sinon).
 
 ## 6. Critères d'acceptation proposés
 
-1. Le Component link et s'instancie sous Wasmtime avec `graph-builder` et `model-config` en `1.6.0`.
-2. Les graphes du 31B, du 26B-A4B et d'un E2B passent la validation Runtime sans attribut rejeté.
+1. Le Component link et s'instancie sous Wasmtime avec `graph-builder` et `model-config` en `1.6.0`. **Vérifié** sur `84093cb` (voir `docs/engine-smoke-test`).
+2. Les graphes du 31B, du 26B-A4B et d'un E2B passent la validation Runtime sans attribut rejeté. **Vérifié** aux formes réelles (formes seules, sans poids) : 1314, 869 et 1094 nœuds.
 3. Conformité Reference CPU, avec fixtures, de : `softcap`, `scale`, `rmsnorm` par tête et sans échelle, `rope` partiel, `attention` avec `scale` et `window_size`, `gelu` tanh, `moe-experts` avec `per_expert_scale` et `gelu_tanh`.
 4. Logits comparés à `transformers` sur un checkpoint réel (prefill puis quelques tokens de decode), pour chaque famille (31B, 26B-A4B, E2B) : **non fait** de notre côté, aucun poids téléchargé.
 5. Variantes quantifiées : même comparaison sur un export GGUF.

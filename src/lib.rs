@@ -10,7 +10,7 @@
 //! tested; `component` (built for `wasm32` or with the `bindings` feature)
 //! only adapts the generated WIT bindings to it.
 //!
-//! Supported: every Gemma 4 text checkpoint family: dense (31B, 12B),
+//! Supported: every Gemma 4 text checkpoint family: dense (31B),
 //! mixture-of-experts (26B-A4B) and the per-layer-input / shared-KV E2B and
 //! E4B. Refused with a trap rather than built incorrectly: RoPE frequency
 //! scaling, attention bias, a shared expert, a non-renormalizing router and

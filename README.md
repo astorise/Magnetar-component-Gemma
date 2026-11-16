@@ -15,7 +15,7 @@ or Devices).
 **Gemma 4 text decoder: graph production implemented; Runtime support pending.**
 The Component builds prefill/decode graphs (and layer segments for
 multi-Device pipelines) for every Gemma 4 text checkpoint family: dense
-(`google/gemma-4-31B-it`, `gemma-4-12B-it`), mixture-of-experts
+(`google/gemma-4-31B-it`), mixture-of-experts
 (`gemma-4-26B-A4B-it`) and the per-layer-input / shared-KV E2B and E4B. The graph logic is in
 `src/plan.rs`, independent of any host, and covered by unit tests against a
 recording `graph-builder` (including the real 31B shape). `src/component.rs`
@@ -136,11 +136,19 @@ cargo build --release --target wasm32-wasip2
 `rust-version = "1.98"` is Magnetar's pinned toolchain. A newer-than-installed
 check can be bypassed locally with `--ignore-rust-version`.
 
-Not yet verified: running the built Component under Magnetar's Wasmtime
-Engine and comparing logits with `transformers` on a real checkpoint, which
-requires the Runtime prerequisites above and the checkpoint weights, which
-were not downloaded here. Only the checkpoints' `config.json` and tensor index
-were read.
+Verified in Magnetar's own Wasmtime engine (`84093cb`): the Component, built
+as `wasm32-unknown-unknown` and wrapped with `wasm-tools component new`,
+links against the real `graph-builder` and `model-config` Capabilities and
+builds graphs the Runtime's validation accepts for layered configurations of
+every variant, at the real shapes of the 31B, 26B-A4B and E2B (shapes only, no
+weight data), including decode graphs, layer segments and the refusal of a
+segment that splits a shared-KV layer from its producer. See
+[`docs/engine-smoke-test`](docs/engine-smoke-test/README.md).
+
+Not yet verified: logits compared with `transformers` on real weights (the
+checkpoints were not downloaded here), and the Component registered with a
+pinned digest in Magnetar. `gemma-4-12B` declares `model_type = gemma4_unified`,
+which Magnetar's loaders do not map yet, so it is not covered.
 
 ## Relationship to magnetar-runtime
 
