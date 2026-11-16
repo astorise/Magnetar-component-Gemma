@@ -18,7 +18,7 @@ feeds both sides.
 | `gemma4_reference_logits.py` | `transformers` reference, greedy, whole sequence recomputed at every step (no KV cache), written as a Magnetar `logit-reference/v1` JSON |
 | `magnetar/gemma4_logits.rs` | Magnetar test: registers the Component, ingests the bundle with the real Hugging Face loader, generates greedily on the Reference CPU Provider, compares with Magnetar's own `compare_logit_references` |
 | `magnetar/Cargo.toml` | the test crate (standalone, outside Magnetar's workspace) |
-| `magnetar/magnetar-runtime-gemma4-local.patch` | the **local** Runtime changes that were needed, see below |
+| `magnetar/magnetar-runtime-gemma4-local.patch` | the local Runtime changes that were needed on `84093cb`, see the end |
 | `run_logit_comparison.sh` | runs all of it |
 
 ```bash
@@ -26,11 +26,15 @@ MAGNETAR_DIR=/path/to/magnetar CARGO_FLAGS=--ignore-rust-version \
   tools/qualification/run_logit_comparison.sh dense shared
 ```
 
-It needs a Magnetar checkout at `84093cb` whose `loaders/huggingface` and
+It needs a Magnetar checkout (`84093cb` with the patch, or the branch above) whose `loaders/huggingface` and
 `formats/safetensors` submodules are populated, `wasm-tools`, and Python with
 torch (CPU), `transformers` 5.x, `safetensors` and `numpy`.
 
-## Results (Magnetar `84093cb` plus the local patch)
+## Results
+
+Magnetar branch `claude/charming-lamport-1b9m74` (`3a0593a`, not merged yet),
+**no local patch**; the same numbers were obtained on `84093cb` plus the patch
+described at the end.
 
 Prompt `[5, 17, 33, 8, 41, 2, 60, 12]`, 12 greedy tokens (one prefill, eleven
 decode steps with a KV cache), Reference CPU, f32, tolerance 1e-3 on the top 8
@@ -65,9 +69,10 @@ Logits are of order 10, so these are float32 rounding differences.
   GGUF) is still to do.
 - CUDA, other Providers, and the decode-step replay path.
 
-## The local Runtime patch
+## The local Runtime patch (no longer needed)
 
-Without it, Magnetar `84093cb` cannot run these models through its production
+The Runtime fixed these on `claude/charming-lamport-1b9m74`; run the script with
+`SKIP_RUNTIME_PATCH=1` there. Without the patch or that fix, Magnetar `84093cb` cannot run these models through its production
 path at all (the bundle ingests, then loading fails). Three places still assume
 Qwen's tensor inventory; the patch changes only them, and it is a diagnostic, not
 a proposal for how Magnetar should fix them:

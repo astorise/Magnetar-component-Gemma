@@ -185,11 +185,11 @@ index f5619dd..2be9be5 100644
 +    let (e, i, h) = (4u64, 6u64, 8u64);
 +    for l in 0..2 {
 +        for (n, d) in [
-+            ("router_proj", vec![h, e]),
-+            ("experts.gate_proj", vec![h, e * i]),
-+            ("experts.up_proj", vec![h, e * i]),
-+            ("experts.down_proj", vec![i, e * h]),
-+            ("experts.per_expert_scale", vec![e]),
++            ("moe.router_proj", vec![h, e]),
++            ("moe.experts_gate_proj", vec![h, e * i]),
++            ("moe.experts_up_proj", vec![h, e * i]),
++            ("moe.experts_down_proj", vec![i, e * h]),
++            ("moe.per_expert_scale", vec![e]),
 +            ("pre_ffn_norm_2", vec![h]),
 +            ("post_ffn_norm_1", vec![h]),
 +            ("post_ffn_norm_2", vec![h]),
@@ -322,11 +322,11 @@ index f5619dd..2be9be5 100644
 +    let (e, i, h) = (128u64, 704u64, 2816u64);
 +    for l in 0..30 {
 +        for (n, d) in [
-+            ("router_proj", vec![h, e]),
-+            ("experts.gate_proj", vec![h, e * i]),
-+            ("experts.up_proj", vec![h, e * i]),
-+            ("experts.down_proj", vec![i, e * h]),
-+            ("experts.per_expert_scale", vec![e]),
++            ("moe.router_proj", vec![h, e]),
++            ("moe.experts_gate_proj", vec![h, e * i]),
++            ("moe.experts_up_proj", vec![h, e * i]),
++            ("moe.experts_down_proj", vec![i, e * h]),
++            ("moe.per_expert_scale", vec![e]),
 +            ("pre_ffn_norm_2", vec![h]),
 +            ("post_ffn_norm_1", vec![h]),
 +            ("post_ffn_norm_2", vec![h]),

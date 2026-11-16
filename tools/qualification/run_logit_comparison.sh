@@ -9,6 +9,7 @@
 # (they are submodules). See tools/qualification/README.md.
 #
 #   (CARGO_FLAGS="--ignore-rust-version" if your rustc is older than the crate's rust-version)
+#   (SKIP_RUNTIME_PATCH=1 once Magnetar no longer needs magnetar-runtime-gemma4-local.patch)
 #   MAGNETAR_DIR=/path/to/magnetar tools/qualification/run_logit_comparison.sh [variant...]
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -29,7 +30,9 @@ echo "== installing the test crate in $MAGNETAR_DIR/scratch-gemma-logits"
 mkdir -p "$MAGNETAR_DIR/scratch-gemma-logits/tests"
 cp "$here/magnetar/Cargo.toml" "$MAGNETAR_DIR/scratch-gemma-logits/Cargo.toml"
 cp "$here/magnetar/gemma4_logits.rs" "$MAGNETAR_DIR/scratch-gemma-logits/tests/gemma4_logits.rs"
-if ! git -C "$MAGNETAR_DIR" apply --check "$here/magnetar/magnetar-runtime-gemma4-local.patch" 2>/dev/null; then
+if [ -n "${SKIP_RUNTIME_PATCH:-}" ]; then
+  echo "   (SKIP_RUNTIME_PATCH set: Magnetar is used as is)"
+elif ! git -C "$MAGNETAR_DIR" apply --check "$here/magnetar/magnetar-runtime-gemma4-local.patch" 2>/dev/null; then
   echo "   (runtime patch already applied or not applicable; continuing)"
 else
   git -C "$MAGNETAR_DIR" apply "$here/magnetar/magnetar-runtime-gemma4-local.patch"

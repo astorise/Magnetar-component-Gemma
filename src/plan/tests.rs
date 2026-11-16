@@ -949,12 +949,12 @@ fn moe_layer_runs_dense_mlp_and_routed_experts_side_by_side() {
         vec![
             "out:layer0.pre_ffn_norm_2".to_string(),
             "out:layer0.router".to_string(),
-            "w:layers.0.experts.gate_proj".to_string(),
-            "w:layers.0.experts.up_proj".to_string(),
-            "w:layers.0.experts.down_proj".to_string(),
+            "w:layers.0.moe.experts_gate_proj".to_string(),
+            "w:layers.0.moe.experts_up_proj".to_string(),
+            "w:layers.0.moe.experts_down_proj".to_string(),
             // Applied by the Operator, never folded into (possibly
             // quantized) expert weights.
-            "w:layers.0.experts.per_expert_scale".to_string(),
+            "w:layers.0.moe.per_expert_scale".to_string(),
         ]
     );
     assert_eq!(attr_of(e, "experts"), Some(&Value::Int(8)));
@@ -1003,14 +1003,14 @@ fn moe_layer_runs_dense_mlp_and_routed_experts_side_by_side() {
 fn moe_weight_names_follow_the_loader_contract() {
     let (r, _) = prefill(&moe(), 2, 0, 1);
     for w in [
-        "layers.0.router_proj",
-        "layers.0.experts.per_expert_scale",
+        "layers.0.moe.router_proj",
+        "layers.0.moe.per_expert_scale",
         "layers.0.pre_ffn_norm_2",
         "layers.0.post_ffn_norm_1",
         "layers.0.post_ffn_norm_2",
-        "layers.0.experts.gate_proj",
-        "layers.0.experts.up_proj",
-        "layers.0.experts.down_proj",
+        "layers.0.moe.experts_gate_proj",
+        "layers.0.moe.experts_up_proj",
+        "layers.0.moe.experts_down_proj",
         "layers.0.mlp.gate_proj",
     ] {
         assert!(r.weights.iter().any(|x| x == w), "missing {w}");
@@ -1193,8 +1193,8 @@ fn expert_scales_are_an_operator_input_not_folded_into_weights() {
     let (r, _) = prefill(&moe(), 3, 0, 1);
     let e = r.node("layer0.experts");
     assert_eq!(e.inputs.len(), 6);
-    assert_eq!(e.inputs[4], "w:layers.0.experts.down_proj");
-    assert_eq!(e.inputs[5], "w:layers.0.experts.per_expert_scale");
+    assert_eq!(e.inputs[4], "w:layers.0.moe.experts_down_proj");
+    assert_eq!(e.inputs[5], "w:layers.0.moe.per_expert_scale");
 }
 
 #[test]

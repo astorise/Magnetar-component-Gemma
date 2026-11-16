@@ -293,8 +293,9 @@ fn tensor_parallel(kind: &str) -> Attr {
 /// Canonical Model Artifact tensor name for a per-layer weight.
 ///
 /// Every name is a checkpoint tensor, possibly re-laid-out by the loader
-/// (stacked experts, per-layer slices, `router_proj` with the router
-/// `scale * hidden_size^-0.5` folded in, as routers stay in float). The two
+/// (stacked experts under `layers.N.moe.*`, per-layer slices, `router_proj`
+/// with the router `scale * hidden_size^-0.5` folded in, as routers stay in
+/// float). The two
 /// scale-less norms (`v_norm`, the router's) have no tensor at all and are
 /// expressed as `rmsnorm` with `with_scale = false`; `per_expert_scale` stays
 /// a separate input of `moe-experts`, so quantized expert weights are never
@@ -310,19 +311,16 @@ pub fn weight_name(layer: u64, suffix: &str) -> String {
         | "pre_ffn_norm_2"
         | "post_ffn_norm_1"
         | "post_ffn_norm_2"
-        | "router_proj"
         // Per-layer inputs (E2B/E4B).
         | "per_layer_input_gate"
         | "per_layer_projection"
         | "post_per_layer_input_norm"
         | "per_layer_embedding"
         | "per_layer_model_projection" => format!("layers.{layer}.{suffix}"),
-        "experts_gate_proj"
-        | "experts_up_proj"
-        | "experts_down_proj"
-        | "experts_per_expert_scale" => {
-            format!("layers.{layer}.experts.{}", &suffix["experts_".len()..])
-        }
+        // Routed experts, under Magnetar's `moe.*` convention (the one its
+        // loaders write and its weight inventory validates).
+        "router_proj" | "experts_gate_proj" | "experts_up_proj" | "experts_down_proj"
+        | "per_expert_scale" => format!("layers.{layer}.moe.{suffix}"),
         "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_norm" | "k_norm" => {
             format!("layers.{layer}.self_attn.{suffix}")
         }
@@ -670,7 +668,7 @@ impl<S: GraphSink> Builder<'_, S> {
             .weight_edge(&weight_name(layer.index, "experts_down_proj"));
         let per_expert = self
             .sink
-            .weight_edge(&weight_name(layer.index, "experts_per_expert_scale"));
+            .weight_edge(&weight_name(layer.index, "per_expert_scale"));
         let routed = self.node(
             format!("{p}.experts"),
             "moe-experts",

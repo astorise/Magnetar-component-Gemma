@@ -108,10 +108,10 @@ Aucun poids n'est fabriqué ; aucun facteur n'est replié dans un poids pouvant 
 | `layers.N.layer_scalar` | `layer_scalar` | `blk.N.layer_output_scale` |
 | `layers.N.pre_ffn_norm_2` | `pre_feedforward_layernorm_2` | `blk.N.pre_ffw_norm_2` |
 | `layers.N.post_ffn_norm_1`, `_2` | `post_feedforward_layernorm_1`, `_2` | `blk.N.post_ffw_norm_1`, `_2` |
-| `layers.N.router_proj` | `router.proj` × `router.scale` × `hidden_size^-0.5` | `blk.N.ffn_gate_inp` × `blk.N.ffn_gate_inp.scale` × `hidden_size^-0.5` |
-| `layers.N.experts.{gate,up}_proj` | moitiés de `experts.gate_up_proj` `[E, 2I, H]`, empilées `[H, E*I]` | `blk.N.ffn_gate_exps`, `ffn_up_exps` (ou `ffn_gate_up_exps` fusionné) |
-| `layers.N.experts.down_proj` | `experts.down_proj`, empilé `[I, E*H]` | `blk.N.ffn_down_exps` |
-| `layers.N.experts.per_expert_scale` | `router.per_expert_scale` | `blk.N.ffn_down_exps.scale` |
+| `layers.N.moe.router_proj` | `router.proj` × `router.scale` × `hidden_size^-0.5` | `blk.N.ffn_gate_inp` × `blk.N.ffn_gate_inp.scale` × `hidden_size^-0.5` |
+| `layers.N.moe.experts_{gate,up}_proj` | moitiés de `experts.gate_up_proj` `[E, 2I, H]`, empilées `[H, E*I]` | `blk.N.ffn_gate_exps`, `ffn_up_exps` (ou `ffn_gate_up_exps` fusionné) |
+| `layers.N.moe.experts_down_proj` | `experts.down_proj`, empilé `[I, E*H]` | `blk.N.ffn_down_exps` |
+| `layers.N.moe.per_expert_scale` | `router.per_expert_scale` | `blk.N.ffn_down_exps.scale` |
 | `layers.N.per_layer_embedding` | colonnes `[N*P, (N+1)*P)` de `embed_tokens_per_layer` | `per_layer_token_embd` (même tranche) |
 | `layers.N.per_layer_model_projection` | tranche `[N*P, (N+1)*P)` de `per_layer_model_projection`, en `[H, P]` | `per_layer_model_proj` (même tranche) |
 | `per_layer_projection_norm` | `per_layer_projection_norm` | `per_layer_proj_norm` |
@@ -143,9 +143,11 @@ Un segment doit contenir les producteurs de ses couches partagées (trap sinon).
 4. Logits comparés à `transformers`. **Fait sur de petits checkpoints aléatoires** de même format (`tools/qualification`) : denses et à KV partagé, écart ≤ 5,5e-5, avec un correctif local du Runtime (voir ci-dessous). **Non fait** : per-layer inputs et MoE (loaders), et les checkpoints réels (31B, 26B-A4B, E2B).
 5. Variantes quantifiées : même comparaison sur un export GGUF.
 
-## 6 bis. Écarts du chemin « production » trouvés par la comparaison
+## 6 bis. Écarts du chemin « production » trouvés par la comparaison (corrigés)
 
-Sur `84093cb`, un bundle Gemma 4 s'ingère mais ne se charge pas : trois endroits supposent encore l'inventaire de tenseurs de Qwen (`validate_first_native_tensor_inventory` exige `k_proj`/`v_proj` à chaque couche ; `first_native_expected_tensor_shape` utilise une largeur de tête et une largeur de MLP globales ; `weight_shapes_for_architecture_config` ignore `q_norm`, `k_norm`, `pre_ffn_norm`, `post_ffn_norm`, `layer_scalar`). Le détail et un patch de diagnostic sont dans `tools/qualification/`. Pour le MoE, `weight_shapes_for_architecture_config` nomme les poids `layers.N.moe.router_proj` et `moe.experts_{gate,up,down}_proj`, alors que ce Component demande `layers.N.router_proj` et `layers.N.experts.{gate,up,down}_proj` (plus `experts.per_expert_scale`, `pre_ffn_norm_2`, `post_ffn_norm_1/2`) : une convention est à choisir.
+Sur `84093cb`, un bundle Gemma 4 s'ingérait mais ne se chargeait pas : trois endroits supposaient l'inventaire de tenseurs de Qwen (`validate_first_native_tensor_inventory`, `first_native_expected_tensor_shape`, `weight_shapes_for_architecture_config`). Le Runtime les a corrigés (OpenSpec `validate-layered-artifacts-in-production`, branche `claude/charming-lamport-1b9m74`, pas encore fusionnée) : l'inventaire et les formes suivent le `LayerSpec` de chaque couche, et les formes données au graph-builder viennent de l'inventaire de l'artefact. La comparaison de `tools/qualification` a été rejouée sur cette branche **sans** le patch local, avec les mêmes résultats (3,481e-5 et 5,484e-5).
+
+Convention MoE retenue par le Runtime, que ce Component suit : `layers.N.moe.router_proj`, `layers.N.moe.experts_{gate,up,down}_proj` et `layers.N.moe.per_expert_scale`. Les normes `pre_ffn_norm_2`, `post_ffn_norm_1` et `post_ffn_norm_2` gardent leurs noms.
 
 ## 7. Hors périmètre
 
