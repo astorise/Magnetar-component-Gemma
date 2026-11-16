@@ -41,10 +41,20 @@ fi
 status=0
 for v in "${variants[@]}"; do
   echo "== variant: $v"
-  python3 "$here/make_tiny_gemma4_bundle.py" "$work/bundle_$v" --variant "$v" >/dev/null
-  python3 "$here/gemma4_reference_logits.py" "$work/bundle_$v" "$steps" "$work/ref_$v.json" $prompt | tail -1
+  format=hf
+  case "$v" in
+    gguf-*)  # a quantized GGUF of the variant after the dash (Q4_0 projections, Q8_0 embedding)
+      base="${v#gguf-}"; format=gguf
+      python3 "$here/make_tiny_gemma4_bundle.py" "$work/bundle_$base" --variant "$base" >/dev/null
+      python3 "$here/make_tiny_gemma4_gguf.py" "$work/bundle_$base" "$work/q4_$base" >/dev/null
+      reference_bundle="$work/q4_$base/ref"; candidate="$work/q4_$base/gguf" ;;
+    *)
+      python3 "$here/make_tiny_gemma4_bundle.py" "$work/bundle_$v" --variant "$v" >/dev/null
+      reference_bundle="$work/bundle_$v"; candidate="$work/bundle_$v" ;;
+  esac
+  python3 "$here/gemma4_reference_logits.py" "$reference_bundle" "$steps" "$work/ref_$v.json" $prompt | tail -1
   (cd "$MAGNETAR_DIR/scratch-gemma-logits" && \
-    GEMMA_COMPONENT="$work/gemma.component.wasm" GEMMA_BUNDLE="$work/bundle_$v" \
+    GEMMA_FORMAT="$format" GEMMA_COMPONENT="$work/gemma.component.wasm" GEMMA_BUNDLE="$candidate" \
     GEMMA_REFERENCE="$work/ref_$v.json" \
     cargo test --test gemma4_logits -- --nocapture 2>&1 | grep -E "tokens :|max \|logit|test result|panicked" ) || status=1
 done

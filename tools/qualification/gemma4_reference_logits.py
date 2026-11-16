@@ -50,6 +50,8 @@ def load_model(bundle):
     cfg = json.load(open(f"{bundle}/config.json"))
     text = dict(cfg.get("text_config", cfg))
     text.pop("dtype", None)
+    # `gemma4_unified_text` is the same decoder under another model type.
+    text["model_type"] = "gemma4_text"
     model = Gemma4ForCausalLM(Gemma4TextConfig(**text)).float().eval()
     tensors = load_file(f"{bundle}/model.safetensors")
     state = {}

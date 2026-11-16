@@ -78,6 +78,11 @@ def text_config(variant):
     )
     if variant == "dense":
         pass
+    elif variant == "unified":
+        # `gemma-4-12B-it`-style bundle: the same dense text decoder under the
+        # `gemma4_unified` model type, with image patches embedded by
+        # `model.vision_embedder.*` (not part of the text decoder).
+        cfg.update(use_bidirectional_attention="vision")
     elif variant == "shared":
         # Gemma 4 E2B/E4B style KV sharing without per-layer inputs: the last
         # 3 layers reuse K/V of the last earlier layer of their attention
@@ -89,7 +94,8 @@ def text_config(variant):
             num_kv_shared_layers=3,
             use_double_wide_mlp=True,
             attention_k_eq_v=False,
-            hidden_size_per_layer_input=8,
+            # A multiple of the 32-element quantization block, so a packed table can be cut per layer.
+            hidden_size_per_layer_input=32,
         )
     elif variant == "moe":
         # 26B-A4B-like: a dense MLP and routed experts side by side.
@@ -97,7 +103,7 @@ def text_config(variant):
             enable_moe_block=True,
             num_experts=8,
             top_k_experts=2,
-            moe_intermediate_size=24,
+            moe_intermediate_size=32,
         )
     else:
         raise SystemExit(f"unknown variant {variant!r}")
@@ -138,6 +144,11 @@ def scaled_init(model, seed):
                 b.copy_(0.6 + torch.rand(b.shape, generator=g) * 0.8)
 
 
+def scaled_vision(seed):
+    g = torch.Generator().manual_seed(seed + 1)
+    return torch.randn((16, 8), generator=g)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
@@ -158,16 +169,19 @@ def main():
         # multimodal bundle nests it under `model.language_model.*`.
         assert name.startswith("model."), name
         tensors["model.language_model." + name[len("model.") :]] = p.detach().float().contiguous()
-    save_file(tensors, os.path.join(args.out_dir, "model.safetensors"), metadata={"format": "pt"})
-
+    unified = args.variant == "unified"
+    if unified:
+        tensors["model.vision_embedder.patch_dense.weight"] = scaled_vision(args.seed)
     bundle_config = {
-        "architectures": ["Gemma4ForConditionalGeneration"],
-        "model_type": "gemma4",
+        "architectures": ["Gemma4UnifiedForConditionalGeneration" if unified else "Gemma4ForConditionalGeneration"],
+        "model_type": "gemma4_unified" if unified else "gemma4",
         "tie_word_embeddings": True,
         "dtype": "float32",
         "eos_token_id": [1, 106],
-        "text_config": {k: v for k, v in cfg.items() if k != "model_type"} | {"model_type": "gemma4_text", "dtype": "float32"},
+        "text_config": {k: v for k, v in cfg.items() if k != "model_type"}
+        | {"model_type": "gemma4_unified_text" if unified else "gemma4_text", "dtype": "float32"},
     }
+    save_file(tensors, os.path.join(args.out_dir, "model.safetensors"), metadata={"format": "pt"})
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
         json.dump(bundle_config, f, indent=2)
         f.write("\n")

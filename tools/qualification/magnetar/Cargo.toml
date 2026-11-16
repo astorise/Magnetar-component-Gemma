@@ -9,6 +9,8 @@ publish = false
 [dev-dependencies]
 magnetar-runtime = { path = "../magnetar-runtime", features = ["wasmtime-component-engine"] }
 magnetar-loader-huggingface = { path = "../loaders/huggingface" }
+magnetar-loader-gguf = { path = "../loaders/gguf" }
+magnetar-format-gguf = { path = "../formats/gguf" }
 magnetar-inference-qualification = { path = "../tools/inference-qualification" }
 serde_json = "1"
 sha2 = "0.11"

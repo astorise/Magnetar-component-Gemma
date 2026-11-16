@@ -47,6 +47,7 @@ compatibility:
   architecture_families:
 {families}  artifact_formats:
     - huggingface
+    - gguf
 wit:
   imports:
     - package: "magnetar:model-component-graph"
@@ -84,34 +85,53 @@ fn gemma4_logits_match_transformers() {
     let trust = ComponentTrustStore::default().trust_digest(&digest.value);
     let registered = register_inference_component_artifact(
         component_bytes,
-        manifest(&digest.value, &["gemma", "gemma4", "gemma4_text"]),
+        manifest(&digest.value, &["gemma", "gemma4", "gemma4_text", "gemma4_unified"]),
         &trust,
     )
     .unwrap_or_else(|e| panic!("component registers: {e}"));
 
     let bundle = PathBuf::from(env("GEMMA_BUNDLE"));
+    let gguf = std::env::var("GEMMA_FORMAT").is_ok_and(|f| f == "gguf");
     let source = ProductionModelSource::authorized_local_bundle(
         ModelArtifactSource::HuggingFace("tiny-gemma4-bundle".into()),
         bundle.clone(),
     );
-    let ingested = HuggingFaceIngestor::new()
-        .ingest(&source)
-        .unwrap_or_else(|e| panic!("bundle ingests: {e}"));
+    let corpus: LogitReference =
+        serde_json::from_slice(&fs::read(env("GEMMA_REFERENCE")).unwrap()).unwrap();
+    let n_new = corpus.steps.len();
+
+    // The same production path for both formats: a Hugging Face bundle
+    // (`config.json`, `tokenizer.json`, safetensors) or a GGUF file.
+    let (ingested, tokenizer_metadata, tokenizer): (_, _, Arc<dyn Tokenizer + Send + Sync>) =
+        if gguf {
+            let ingested = magnetar_loader_gguf::GgufIngestor::new()
+                .ingest(&source)
+                .unwrap_or_else(|e| panic!("GGUF ingests: {e}"));
+            let bytes = fs::read(bundle.join("model.gguf")).unwrap();
+            let artifact = magnetar_format_gguf::parse(&bytes).unwrap();
+            let t = magnetar_loader_gguf::GgufTokenizer::from_gguf_metadata(
+                &artifact.metadata,
+                "tiny-gemma4",
+                Some(64),
+            )
+            .unwrap();
+            let metadata = t.metadata().clone();
+            (ingested, metadata, Arc::new(t))
+        } else {
+            let ingested = HuggingFaceIngestor::new()
+                .ingest(&source)
+                .unwrap_or_else(|e| panic!("bundle ingests: {e}"));
+            let tokenizer_bytes = fs::read(bundle.join("tokenizer.json")).unwrap();
+            let t = HuggingFaceTokenizer::from_bytes(&tokenizer_bytes, None, "tiny-gemma4", Some(64))
+                .unwrap();
+            let metadata = t.metadata().clone();
+            (ingested, metadata, Arc::new(t))
+        };
     eprintln!(
         "ingested family = {:?}, layers = {}",
         ingested.manifest.architecture.family,
         ingested.manifest.architecture_config.as_ref().map(|c| c.num_hidden_layers).unwrap_or(0)
     );
-
-    let corpus: LogitReference =
-        serde_json::from_slice(&fs::read(env("GEMMA_REFERENCE")).unwrap()).unwrap();
-    let n_new = corpus.steps.len();
-
-    let tokenizer_bytes = fs::read(bundle.join("tokenizer.json")).unwrap();
-    let tokenizer =
-        HuggingFaceTokenizer::from_bytes(&tokenizer_bytes, None, "tiny-gemma4", Some(64)).unwrap();
-    let tokenizer_metadata = tokenizer.metadata().clone();
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
     let fixture =
         production_model_fixture(ingested.manifest.clone(), tokenizer_metadata, tokenizer).unwrap();
     let trust_store =

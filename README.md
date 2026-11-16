@@ -147,16 +147,18 @@ segment that splits a shared-KV layer from its producer. See
 
 Logits compared with `transformers` (float32, `tools/qualification`): on tiny
 random Gemma 4 checkpoints of the real bundle layout, the Component run by
-Magnetar's Reference CPU Provider (`main` at `1f21bd7`, no local patch) gives
-the same tokens and logits over 12 greedy steps, within 3.5e-5 (dense), 5.5e-5
-(shared KV with a wider MLP), 4.9e-5 (per-layer inputs) and 1.8e-5 (routed
-experts). The comparison fails by 1.1 to 14 when a mechanism is changed in the
-reference.
+Magnetar's Reference CPU Provider (`main` at `dbe2f1c`, no local patch) gives
+the same tokens and logits over 12 greedy steps, within 5.5e-5 for the dense,
+shared-KV, per-layer-input, routed-experts and `gemma4_unified` (12B-style)
+variants, and within 1.1e-4 for the same models as quantized GGUF files
+(`Q4_0` projections, `Q8_0` tables, compared with a reference computed on the
+dequantized weights). The comparison fails by 1.1 to 14 when a mechanism is
+changed in the reference.
 
-Not yet verified: the real checkpoints and quantized GGUF (`Q4_0` is not decoded
-yet), CUDA and other Providers, and the Component registered with a pinned
-digest in Magnetar. `gemma-4-12B` declares `model_type = gemma4_unified`, which
-Magnetar's loaders do not map, so it is not covered.
+Not yet verified: the real checkpoints (only tiny random ones were run), sizes
+beyond 6 layers and 8 experts numerically, CUDA and the optimized CPU Provider,
+multi-device placement, and the Component registered with a pinned digest in
+Magnetar.
 
 ## Relationship to magnetar-runtime
 
