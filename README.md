@@ -2,9 +2,9 @@
 
 ## Purpose
 
-A WebAssembly Component implementing the Google Gemma model families for the
-[Magnetar](https://github.com/astorise/Magnetar) local AI Runtime. It will
-supply prefill/decode graph semantics for Gemma-compatible Model Artifacts
+A WebAssembly Component implementing the Google Gemma 4 model family for the
+[Magnetar](https://github.com/astorise/Magnetar) local AI Runtime. It
+supplies prefill/decode graph semantics for Gemma-compatible Model Artifacts
 through the Runtime's Model Component contract, without ever selecting a
 Provider, Device, or receiving native Runtime handles -- per Magnetar's
 architectural invariants (Components request Capabilities, not Providers
@@ -12,33 +12,153 @@ or Devices).
 
 ## Status
 
-**Empty template.** This crate is a scaffold: no Gemma graph logic, no WIT
-bindings and no Component Model exports exist here yet, and the Runtime has
-no Gemma implementation of its own either. It is pinned into Magnetar as a
-placeholder so the work has a home; it is not yet scheduled against an
-OpenSpec change of its own.
+**Gemma 4 text decoder: graph production implemented; Runtime support pending.**
+The Component builds prefill/decode graphs (and layer segments for
+multi-Device pipelines) for every Gemma 4 text checkpoint family: dense
+(`google/gemma-4-31B-it`), mixture-of-experts
+(`gemma-4-26B-A4B-it`) and the per-layer-input / shared-KV E2B and E4B. The graph logic is in
+`src/plan.rs`, independent of any host, and covered by unit tests against a
+recording `graph-builder` (including the real 31B shape). `src/component.rs`
+only adapts the WIT bindings to it.
 
-## What this family needs
+It does **not** run end to end yet: it needs the Runtime changes listed under
+[Runtime prerequisites](#runtime-prerequisites).
 
-What sets this family apart from the generic decoder block
-`components/qwen` and `components/llama` already implement, each to be
-checked against the exact pinned checkpoint's `config.json` before it is
-implemented:
+### What a Gemma 4 layer is
 
-- A GeGLU MLP (tanh-approximated GELU gate) instead of SwiGLU, an RMSNorm whose scale is `1 + weight`, and token embeddings scaled by `sqrt(hidden_size)`, with the output projection tied to the embedding table.
-- Gemma 2: logit and attention soft-capping, sandwich normalization (a norm both before and after each attention and MLP block), and attention layers alternating between a sliding local window and global attention.
-- Gemma 3: query/key normalization, mostly local sliding-window layers with periodic global ones, and a different RoPE base for local and global layers; its larger checkpoints are multimodal (vision input), which `explore-multimodal-and-embedding-components` covers.
-- A 256k-token vocabulary, so the LM head is the largest single matmul of a decode step.
+Verified against `transformers`' `modeling_gemma4.py` and the checkpoints'
+`config.json`; it differs from Gemma 1-3:
+
+- RMSNorm scale is the plain `weight` (not `1 + weight`); token embeddings are
+  scaled by `sqrt(hidden_size)`; the output projection is tied to the
+  embedding table.
+- Sandwich normalization: `input_norm` -> attention -> `post_attn_norm` ->
+  residual, then `pre_ffn_norm` -> GeGLU MLP (`gelu_pytorch_tanh`) ->
+  `post_ffn_norm` -> residual, then the result is multiplied by a per-layer
+  `layer_scalar`.
+- Queries and keys get a per-head RMSNorm, values a weightless one
+  (`v_norm`); attention uses `scale = 1.0`.
+- `layer_types` alternates `sliding_attention` layers (window 1024, 256-wide
+  heads, RoPE base 10 000) with `full_attention` layers (512-wide global heads
+  with their own KV head count, RoPE base 1 000 000, "proportional" partial
+  rotary factor 0.25). With `attention_k_eq_v`, full layers have no V
+  projection: V is K's raw projection.
+- Logits are soft-capped: `30 * tanh(logits / 30)`.
+
+### Variants
+
+- **MoE (26B-A4B)**: each layer runs the dense GeGLU MLP *and* a routed
+  expert branch side by side (`post_ffn_norm_1`, router + `moe-experts`,
+  `pre_ffn_norm_2`/`post_ffn_norm_2`), sums them, then applies the layer's
+  `post_ffn_norm`. The router scores the un-normalized residual stream.
+  Uses Magnetar's existing `moe-experts` Operator.
+- **Per-layer inputs (E2B/E4B)**: every layer receives a slice of a
+  token-identity embedding mixed with a projection of the scaled embeddings,
+  gates the hidden state with it and adds a normalized residual before the
+  `layer_scalar`. A segment not starting at layer 0 re-declares `token_ids`
+  and recomputes the embeddings it needs.
+- **Shared KV (E2B/E4B)**: the last `num_kv_shared_layers` layers have no
+  K/V weights and attend over the K/V of the last earlier layer of the same
+  attention kind, using the producer's edges (so they allocate no KV
+  resource). Their feed-forward is twice as wide when `use_double_wide_mlp`.
+  A segment must contain the producers of its shared layers.
+
+### Not implemented
+
+- **Vision and audio towers.** Gemma 4's image/audio inputs need Operators and
+  input types (patch embedding, 2-D RoPE, bidirectional vision attention,
+  conformer audio blocks, embedding injection at image/audio token positions)
+  and a way to pass non-token inputs, none of which `graph-builder` models
+  today (inputs are token ids and `float32` tensors only). This belongs in the
+  multimodal work tracked by `explore-multimodal-and-embedding-components`,
+  as its own Components; this one is the text decoder only.
+- Building a graph traps with an explicit reason for RoPE frequency scaling,
+  attention bias, a shared expert, a router that does not renormalize, and any
+  inconsistent configuration.
+- Gemma 1-3 are not served by this Component (they need `1 + weight` norms
+  and, for Gemma 2/3, different attention rules).
 
 ## Governing contract
 
-None dedicated yet. A real implementation will target the same
-`model-component-graph-contract` WIT interface (`magnetar:model-component-graph`)
-`components/qwen` and `components/llama` implement, extended additively
-where this family needs Operators or state the contract does not model yet.
-Family-specific requirements will be scoped in the main repository's
-`openspec/` (the `qualify-additional-model-and-state-families` change tracks
-qualifying new families).
+Targets `magnetar:model-component-graph`, world `model-component-graph-producer`
+(`wit/model-component-graph.wit`, version **1.6.0**): the `1.5.0`
+`graph-builder` and `model-config` interfaces unchanged, plus a **family-neutral,
+additive** extension of `model-config` (nothing in it names Gemma, and the
+Component imports no interface of its own):
+
+- `layer-layout() -> option<list<layer-spec>>`: per decoder layer, the sliding
+  window, head width, KV head count, RoPE base, partial rotary factor,
+  value-from-key, the earlier layer whose K/V it reuses, and its feed-forward
+  width. The Runtime derives every field from the checkpoint; the Component
+  only validates the layout and never re-implements a per-layer rule.
+- `options() -> architecture-options`: logit soft-capping and the per-layer
+  input width.
+
+Exports are the same four as `components/qwen` and `components/llama`.
+
+Weight logical names follow `components/llama` (`layers.N.self_attn.q_proj`,
+`layers.N.mlp.gate_proj`, ...) plus `q_norm`, `k_norm`, `pre_ffn_norm`,
+`post_ffn_norm`, `layer_scalar` per layer; MoE and per-layer-input names are
+listed in the requirements document.
+
+## Runtime prerequisites
+
+None of these exist in Magnetar `main` today; each is rejected fail-closed
+until added, so this Component cannot silently misbehave against an older
+Runtime. They are tracked in
+[astorise/Magnetar#187](https://github.com/astorise/Magnetar/issues/187), where
+the Runtime team has reviewed them, and detailed in
+[`docs/magnetar-runtime-requirements.md`](docs/magnetar-runtime-requirements.md).
+
+1. **WIT `1.6.0`**: `model-config.layer-layout` and `options`, filled from the
+   checkpoint.
+2. **Operator attributes**: `embedding.scale`; `attention.scale`;
+   `rope.partial_rotary_factor`; `gelu.approximate = "tanh"`; `rmsnorm`
+   per-head (`head_count`, `head_dimension`) and scale-less
+   (`with_scale = false`, one input); `moe-experts.activation = "gelu_tanh"` and
+   a sixth `per_expert_scale` input; and `activation` of `kind = "softcap"`
+   (`cap`) and `kind = "scale"` (`factor`); `mul` broadcasting a
+   `[1]`-shaped operand from its shape (for `layer_scalar`).
+   `attention.window_size`, `gelu` and `moe-experts` already exist.
+3. **Loader**: map the checkpoint's tensors (Hugging Face
+   `model.language_model.*` or GGUF `gemma4`) to the logical names. No weight
+   is fabricated and no scale is folded into a weight that may be quantized;
+   the only derivation is the router's `scale * hidden^-0.5` folded into the
+   float `router_proj`.
+
+## Verification
+
+```bash
+cargo test --features bindings          # graph logic + WIT bridge
+cargo build --release --target wasm32-wasip2
+```
+
+`rust-version = "1.98"` is Magnetar's pinned toolchain. A newer-than-installed
+check can be bypassed locally with `--ignore-rust-version`.
+
+Verified in Magnetar's own Wasmtime engine (`84093cb`): the Component, built
+as `wasm32-unknown-unknown` and wrapped with `wasm-tools component new`,
+links against the real `graph-builder` and `model-config` Capabilities and
+builds graphs the Runtime's validation accepts for layered configurations of
+every variant, at the real shapes of the 31B, 26B-A4B and E2B (shapes only, no
+weight data), including decode graphs, layer segments and the refusal of a
+segment that splits a shared-KV layer from its producer. See
+[`docs/engine-smoke-test`](docs/engine-smoke-test/README.md).
+
+Logits compared with `transformers` (float32, `tools/qualification`): on tiny
+random Gemma 4 checkpoints of the real bundle layout, the Component run by
+Magnetar's Reference CPU Provider (`main` at `dbe2f1c`, no local patch) gives
+the same tokens and logits over 12 greedy steps, within 5.5e-5 for the dense,
+shared-KV, per-layer-input, routed-experts and `gemma4_unified` (12B-style)
+variants, and within 1.1e-4 for the same models as quantized GGUF files
+(`Q4_0` projections, `Q8_0` tables, compared with a reference computed on the
+dequantized weights). The comparison fails by 1.1 to 14 when a mechanism is
+changed in the reference.
+
+Not yet verified: the real checkpoints (only tiny random ones were run), sizes
+beyond 6 layers and 8 experts numerically, CUDA and the optimized CPU Provider,
+multi-device placement, and the Component registered with a pinned digest in
+Magnetar.
 
 ## Relationship to magnetar-runtime
 

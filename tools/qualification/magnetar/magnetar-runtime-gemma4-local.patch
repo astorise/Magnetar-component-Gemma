@@ -1,0 +1,92 @@
+diff --git a/magnetar-runtime/src/first_native_runtime/production.rs b/magnetar-runtime/src/first_native_runtime/production.rs
+index 51aa27b..fbd6a15 100644
+--- a/magnetar-runtime/src/first_native_runtime/production.rs
++++ b/magnetar-runtime/src/first_native_runtime/production.rs
+@@ -251,6 +251,16 @@ pub(super) fn weight_shapes_for_architecture_config(
+             vec![q_dim, config.hidden_size],
+         );
+         shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
++        if config.layer_layout.is_some() {
++            // SCRATCH(gemma4): the sandwich norms, q/k norms and layer scalar.
++            shapes.insert(format!("{prefix}.pre_ffn_norm"), vec![config.hidden_size]);
++            shapes.insert(format!("{prefix}.post_ffn_norm"), vec![config.hidden_size]);
++            shapes.insert(format!("{prefix}.layer_scalar"), vec![1]);
++            shapes.insert(format!("{prefix}.self_attn.q_norm"), vec![head_dim]);
++            if own_kv {
++                shapes.insert(format!("{prefix}.self_attn.k_norm"), vec![head_dim]);
++            }
++        }
+         if let Some(moe) = &config.mixture_of_experts {
+             // `execute-and-cache-moe-experts` F02: stacked expert weights,
+             // each expert a column range (see the `moe-experts` Operator).
+diff --git a/magnetar-runtime/src/qwen_model_component.rs b/magnetar-runtime/src/qwen_model_component.rs
+index b0df324..e082409 100644
+--- a/magnetar-runtime/src/qwen_model_component.rs
++++ b/magnetar-runtime/src/qwen_model_component.rs
+@@ -797,6 +797,24 @@ pub fn validate_first_native_tensor_inventory(
+         if expected.ends_with("mlp.gate_up_proj") {
+             continue;
+         }
++        // SCRATCH(gemma4): a layer with no value projection (`value_from_key`)
++        // or that reuses another layer's K/V carries no such weights.
++        if let (Some(layout), Some((layer, rest))) = (
++            config.layer_layout.as_ref(),
++            expected
++                .strip_prefix("layers.")
++                .and_then(|r| r.split_once('.')),
++        ) {
++            if let Some(spec) = layer.parse::<usize>().ok().and_then(|i| layout.get(i)) {
++                let reuses = spec.kv_source_layer.is_some();
++                let no_v = reuses || spec.value_from_key;
++                if (rest == "self_attn.v_proj" && no_v)
++                    || (rest == "self_attn.k_proj" && reuses)
++                {
++                    continue;
++                }
++            }
++        }
+         // A mixture-of-experts layer (`execute-and-cache-moe-experts` F02)
+         // has a router and stacked experts instead of the dense MLP.
+         if let Some((layer, mlp)) = expected
+@@ -839,7 +857,20 @@ pub fn first_native_expected_tensor_shape(
+         "lm_head" => return Some(vec![a.hidden_size, a.vocabulary_size]),
+         _ => {}
+     }
+-    let rest = name.strip_prefix("layers.")?.split_once('.')?.1;
++    let (layer, rest) = name.strip_prefix("layers.")?.split_once('.')?;
++    // SCRATCH(gemma4): per-layer geometry from the layout, when declared.
++    let spec = config
++        .layer_layout
++        .as_ref()
++        .and_then(|layout| layout.get(layer.parse::<usize>().ok()?));
++    let (q_dim, kv_dim, intermediate) = match spec {
++        Some(spec) => (
++            a.attention_head_count * spec.head_dim,
++            u64::from(spec.num_key_value_heads) * spec.head_dim,
++            spec.intermediate_size,
++        ),
++        None => (q_dim, kv_dim, a.intermediate_size),
++    };
+     match rest {
+         "input_norm" | "post_attn_norm" => Some(vec![a.hidden_size]),
+         "self_attn.q_proj" => Some(vec![a.hidden_size, q_dim]),
+@@ -852,7 +883,7 @@ pub fn first_native_expected_tensor_shape(
+         "self_attn.q_bias" => Some(vec![q_dim]),
+         "self_attn.k_bias" | "self_attn.v_bias" => Some(vec![kv_dim]),
+         "self_attn.o_proj" => Some(vec![q_dim, a.hidden_size]),
+-        "mlp.gate_proj" | "mlp.up_proj" => Some(vec![a.hidden_size, a.intermediate_size]),
++        "mlp.gate_proj" | "mlp.up_proj" => Some(vec![a.hidden_size, intermediate]),
+         // Fused gate/up projection (`define-provider-prepared-kernel-
+         // execution-contract` task group 3): additional to (not a
+         // replacement for) the standalone shapes above -- see
+@@ -862,8 +893,8 @@ pub fn first_native_expected_tensor_shape(
+         // than two separate matmuls -- a genuine real-world LLM-serving
+         // fusion, and the one graph shape that recipe exercises a
+         // two-output Kernel with.
+-        "mlp.gate_up_proj" => Some(vec![a.hidden_size, 2 * a.intermediate_size]),
+-        "mlp.down_proj" => Some(vec![a.intermediate_size, a.hidden_size]),
++        "mlp.gate_up_proj" => Some(vec![a.hidden_size, 2 * intermediate]),
++        "mlp.down_proj" => Some(vec![intermediate, a.hidden_size]),
+         _ => None,
+     }
+ }
