@@ -140,8 +140,12 @@ Un segment doit contenir les producteurs de ses couches partagées (trap sinon).
 1. Le Component link et s'instancie sous Wasmtime avec `graph-builder` et `model-config` en `1.6.0`. **Vérifié** sur `84093cb` (voir `docs/engine-smoke-test`).
 2. Les graphes du 31B, du 26B-A4B et d'un E2B passent la validation Runtime sans attribut rejeté. **Vérifié** aux formes réelles (formes seules, sans poids) : 1314, 869 et 1094 nœuds.
 3. Conformité Reference CPU, avec fixtures, de : `softcap`, `scale`, `rmsnorm` par tête et sans échelle, `rope` partiel, `attention` avec `scale` et `window_size`, `gelu` tanh, `moe-experts` avec `per_expert_scale` et `gelu_tanh`.
-4. Logits comparés à `transformers` sur un checkpoint réel (prefill puis quelques tokens de decode), pour chaque famille (31B, 26B-A4B, E2B) : **non fait** de notre côté, aucun poids téléchargé.
+4. Logits comparés à `transformers`. **Fait sur de petits checkpoints aléatoires** de même format (`tools/qualification`) : denses et à KV partagé, écart ≤ 5,5e-5, avec un correctif local du Runtime (voir ci-dessous). **Non fait** : per-layer inputs et MoE (loaders), et les checkpoints réels (31B, 26B-A4B, E2B).
 5. Variantes quantifiées : même comparaison sur un export GGUF.
+
+## 6 bis. Écarts du chemin « production » trouvés par la comparaison
+
+Sur `84093cb`, un bundle Gemma 4 s'ingère mais ne se charge pas : trois endroits supposent encore l'inventaire de tenseurs de Qwen (`validate_first_native_tensor_inventory` exige `k_proj`/`v_proj` à chaque couche ; `first_native_expected_tensor_shape` utilise une largeur de tête et une largeur de MLP globales ; `weight_shapes_for_architecture_config` ignore `q_norm`, `k_norm`, `pre_ffn_norm`, `post_ffn_norm`, `layer_scalar`). Le détail et un patch de diagnostic sont dans `tools/qualification/`. Pour le MoE, `weight_shapes_for_architecture_config` nomme les poids `layers.N.moe.router_proj` et `moe.experts_{gate,up,down}_proj`, alors que ce Component demande `layers.N.router_proj` et `layers.N.experts.{gate,up,down}_proj` (plus `experts.per_expert_scale`, `pre_ffn_norm_2`, `post_ffn_norm_1/2`) : une convention est à choisir.
 
 ## 7. Hors périmètre
 

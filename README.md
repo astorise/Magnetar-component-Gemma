@@ -145,10 +145,19 @@ weight data), including decode graphs, layer segments and the refusal of a
 segment that splits a shared-KV layer from its producer. See
 [`docs/engine-smoke-test`](docs/engine-smoke-test/README.md).
 
-Not yet verified: logits compared with `transformers` on real weights (the
-checkpoints were not downloaded here), and the Component registered with a
-pinned digest in Magnetar. `gemma-4-12B` declares `model_type = gemma4_unified`,
-which Magnetar's loaders do not map yet, so it is not covered.
+Logits compared with `transformers` (float32, `tools/qualification`): on tiny
+random Gemma 4 checkpoints of the real bundle layout, the Component run by
+Magnetar's Reference CPU Provider gives the same tokens and logits within
+3.5e-5 (dense) and 5.5e-5 (shared KV with a wider MLP) over 12 greedy steps,
+and the comparison fails by 1.1 to 14 when a mechanism is changed in the
+reference. This needed a small **local** Runtime patch: `84093cb` still checks
+tensors against Qwen's inventory (see `tools/qualification/README.md`).
+
+Not yet verified: the per-layer-input and MoE variants (Magnetar's loaders do
+not slice per-layer tables or restack experts yet), the real checkpoints and
+quantized GGUF, and the Component registered with a pinned digest in
+Magnetar. `gemma-4-12B` declares `model_type = gemma4_unified`, which
+Magnetar's loaders do not map yet, so it is not covered.
 
 ## Relationship to magnetar-runtime
 

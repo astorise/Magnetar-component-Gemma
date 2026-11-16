@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "scratch-gemma-logits"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dev-dependencies]
+magnetar-runtime = { path = "../magnetar-runtime", features = ["wasmtime-component-engine"] }
+magnetar-loader-huggingface = { path = "../loaders/huggingface" }
+magnetar-inference-qualification = { path = "../tools/inference-qualification" }
+serde_json = "1"
+sha2 = "0.11"
