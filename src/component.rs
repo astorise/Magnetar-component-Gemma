@@ -92,6 +92,11 @@ fn wit_attr(attr: &Attr) -> gb::Attribute {
 /// Reads the active Model Instance's configuration. Each call re-queries the
 /// Capabilities: no dimension is cached or compiled in.
 fn load_config() -> Config {
+    match model_config::hidden_activation().as_deref() {
+        Some("gelu_pytorch_tanh") => {}
+        Some(other) => panic!("gemma: unsupported checkpoint activation {other:?}"),
+        None => panic!("gemma: checkpoint activation is unknown"),
+    }
     let a = model_config::model_config();
     // A Gemma graph needs the per-layer layout; a Runtime that has none for
     // the active Model Instance cannot be served by this Component.

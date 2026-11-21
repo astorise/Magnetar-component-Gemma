@@ -1,5 +1,5 @@
 //! Google Gemma 4 (text decoder) Model Component for the Magnetar local AI
-//! Runtime (`magnetar:model-component-graph@1.6.0`).
+//! Runtime (`magnetar:model-component-graph@1.8.0`).
 //!
 //! Builds prefill and decode Execution Graphs through the Runtime-owned
 //! `graph-builder` and `model-config` Capabilities; the additive per-layer

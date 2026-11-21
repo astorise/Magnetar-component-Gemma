@@ -12,7 +12,7 @@ or Devices).
 
 ## Status
 
-**Gemma 4 text decoder: graph production implemented; Runtime support pending.**
+**Gemma 4 text decoder: graph production and tiny-checkpoint inference implemented.**
 The Component builds prefill/decode graphs (and layer segments for
 multi-Device pipelines) for every Gemma 4 text checkpoint family: dense
 (`google/gemma-4-31B-it`), mixture-of-experts
@@ -21,8 +21,13 @@ multi-Device pipelines) for every Gemma 4 text checkpoint family: dense
 recording `graph-builder` (including the real 31B shape). `src/component.rs`
 only adapts the WIT bindings to it.
 
-It does **not** run end to end yet: it needs the Runtime changes listed under
-[Runtime prerequisites](#runtime-prerequisites).
+The Component reads the checkpoint activation through `model-config` 1.8.0
+and refuses unknown or non-`gelu_pytorch_tanh` activations before building a
+graph.
+
+Magnetar compares tiny Hugging Face and quantized GGUF checkpoints with
+reference logits. Released checkpoint weights and every hardware backend
+require separate qualification.
 
 ### What a Gemma 4 layer is
 
@@ -81,7 +86,7 @@ Verified against `transformers`' `modeling_gemma4.py` and the checkpoints'
 ## Governing contract
 
 Targets `magnetar:model-component-graph`, world `model-component-graph-producer`
-(`wit/model-component-graph.wit`, version **1.6.0**): the `1.5.0`
+(`wit/model-component-graph.wit`, version **1.8.0**): the `1.5.0`
 `graph-builder` and `model-config` interfaces unchanged, plus a **family-neutral,
 additive** extension of `model-config` (nothing in it names Gemma, and the
 Component imports no interface of its own):
@@ -93,6 +98,7 @@ Component imports no interface of its own):
   only validates the layout and never re-implements a per-layer rule.
 - `options() -> architecture-options`: logit soft-capping and the per-layer
   input width.
+- `hidden-activation()`: the checkpoint's normalized activation.
 
 Exports are the same four as `components/qwen` and `components/llama`.
 
@@ -103,15 +109,12 @@ listed in the requirements document.
 
 ## Runtime prerequisites
 
-None of these exist in Magnetar `main` today; each is rejected fail-closed
-until added, so this Component cannot silently misbehave against an older
-Runtime. They are tracked in
-[astorise/Magnetar#187](https://github.com/astorise/Magnetar/issues/187), where
-the Runtime team has reviewed them, and detailed in
-[`docs/magnetar-runtime-requirements.md`](docs/magnetar-runtime-requirements.md).
+The Runtime must provide these capabilities and matching loader mappings;
+unsupported configurations are rejected. The original requirements are
+documented in [`docs/magnetar-runtime-requirements.md`](docs/magnetar-runtime-requirements.md).
 
-1. **WIT `1.6.0`**: `model-config.layer-layout` and `options`, filled from the
-   checkpoint.
+1. **WIT `1.8.0`**: `model-config.layer-layout`, `options` and
+   `hidden-activation`, filled from the checkpoint.
 2. **Operator attributes**: `embedding.scale`; `attention.scale`;
    `rope.partial_rotary_factor`; `gelu.approximate = "tanh"`; `rmsnorm`
    per-head (`head_count`, `head_dimension`) and scale-less
