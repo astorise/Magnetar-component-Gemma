@@ -1,0 +1,77 @@
+begin Prefill sequence=5 offset=0
+input hidden_states_in [5, 32]
+weight layers.2.input_norm
+node layer2.input_norm op=rmsnorm family=Normalization inputs=["input:hidden_states_in", "weight:layers.2.input_norm"] shape=[5, 32] epsilon=float:1e-6
+weight layers.2.self_attn.q_proj
+node layer2.q_proj op=matmul family=LinearAlgebra inputs=["out:layer2.input_norm", "weight:layers.2.self_attn.q_proj"] shape=[5, 64]
+weight layers.2.self_attn.q_norm
+node layer2.q_norm op=rmsnorm family=Normalization inputs=["out:layer2.q_proj", "weight:layers.2.self_attn.q_norm"] shape=[5, 64] epsilon=float:1e-6 head_count=int:4 head_dimension=int:16
+node layer2.rope_q op=rope family=PositionEncoding inputs=["out:layer2.q_norm"] shape=[5, 64] base=float:1000000.0 dimension=int:16 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:4 partial_rotary_factor=float:0.25
+weight layers.2.self_attn.k_proj
+node layer2.k_proj op=matmul family=LinearAlgebra inputs=["out:layer2.input_norm", "weight:layers.2.self_attn.k_proj"] shape=[5, 16]
+weight layers.2.self_attn.k_norm
+node layer2.k_norm op=rmsnorm family=Normalization inputs=["out:layer2.k_proj", "weight:layers.2.self_attn.k_norm"] shape=[5, 16] epsilon=float:1e-6 head_count=int:1 head_dimension=int:16
+kv 2 K
+node layer2.rope_k op=rope family=PositionEncoding inputs=["out:layer2.k_norm"] shape=[5, 16] base=float:1000000.0 dimension=int:16 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:1 partial_rotary_factor=float:0.25 kv=(kv:2:K, K, append=false)
+kv 2 V
+node layer2.v_norm op=rmsnorm family=Normalization inputs=["out:layer2.k_proj"] shape=[5, 16] epsilon=float:1e-6 with_scale=bool:false head_count=int:1 head_dimension=int:16 kv=(kv:2:V, V, append=false)
+node layer2.attention op=attention family=Attention inputs=["out:layer2.rope_q", "out:layer2.rope_k", "out:layer2.v_norm"] shape=[5, 64] causal=bool:true head_count=int:4 kv_head_count=int:1 head_dimension=int:16 attention_mask_kind=text:causal scale=float:1.0
+weight layers.2.self_attn.o_proj
+node layer2.o_proj op=matmul family=LinearAlgebra inputs=["out:layer2.attention", "weight:layers.2.self_attn.o_proj"] shape=[5, 32]
+weight layers.2.post_attn_norm
+node layer2.post_attn_norm op=rmsnorm family=Normalization inputs=["out:layer2.o_proj", "weight:layers.2.post_attn_norm"] shape=[5, 32] epsilon=float:1e-6
+node layer2.residual1 op=residual-add family=Tensor inputs=["input:hidden_states_in", "out:layer2.post_attn_norm"] shape=[5, 32]
+weight layers.2.pre_ffn_norm
+node layer2.pre_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer2.residual1", "weight:layers.2.pre_ffn_norm"] shape=[5, 32] epsilon=float:1e-6
+weight layers.2.mlp.gate_proj
+node layer2.gate_proj op=matmul family=LinearAlgebra inputs=["out:layer2.pre_ffn_norm", "weight:layers.2.mlp.gate_proj"] shape=[5, 64] tensor_parallel=text:column
+weight layers.2.mlp.up_proj
+node layer2.up_proj op=matmul family=LinearAlgebra inputs=["out:layer2.pre_ffn_norm", "weight:layers.2.mlp.up_proj"] shape=[5, 64] tensor_parallel=text:column
+node layer2.gelu op=gelu family=Activation inputs=["out:layer2.gate_proj"] shape=[5, 64] approximate=text:tanh tensor_parallel=text:local
+node layer2.mul op=mul family=Tensor inputs=["out:layer2.gelu", "out:layer2.up_proj"] shape=[5, 64] tensor_parallel=text:local
+weight layers.2.mlp.down_proj
+node layer2.down_proj op=matmul family=LinearAlgebra inputs=["out:layer2.mul", "weight:layers.2.mlp.down_proj"] shape=[5, 32] tensor_parallel=text:row
+weight layers.2.post_ffn_norm
+node layer2.post_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer2.down_proj", "weight:layers.2.post_ffn_norm"] shape=[5, 32] epsilon=float:1e-6
+node layer2.residual2 op=residual-add family=Tensor inputs=["out:layer2.residual1", "out:layer2.post_ffn_norm"] shape=[5, 32]
+weight layers.2.layer_scalar
+node layer2.layer_scalar op=mul family=Tensor inputs=["out:layer2.residual2", "weight:layers.2.layer_scalar"] shape=[5, 32]
+weight layers.3.input_norm
+node layer3.input_norm op=rmsnorm family=Normalization inputs=["out:layer2.layer_scalar", "weight:layers.3.input_norm"] shape=[5, 32] epsilon=float:1e-6
+weight layers.3.self_attn.q_proj
+node layer3.q_proj op=matmul family=LinearAlgebra inputs=["out:layer3.input_norm", "weight:layers.3.self_attn.q_proj"] shape=[5, 32]
+weight layers.3.self_attn.q_norm
+node layer3.q_norm op=rmsnorm family=Normalization inputs=["out:layer3.q_proj", "weight:layers.3.self_attn.q_norm"] shape=[5, 32] epsilon=float:1e-6 head_count=int:4 head_dimension=int:8
+node layer3.rope_q op=rope family=PositionEncoding inputs=["out:layer3.q_norm"] shape=[5, 32] base=float:10000.0 dimension=int:8 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:4
+weight layers.3.self_attn.k_proj
+node layer3.k_proj op=matmul family=LinearAlgebra inputs=["out:layer3.input_norm", "weight:layers.3.self_attn.k_proj"] shape=[5, 16]
+weight layers.3.self_attn.v_proj
+node layer3.v_proj op=matmul family=LinearAlgebra inputs=["out:layer3.input_norm", "weight:layers.3.self_attn.v_proj"] shape=[5, 16]
+weight layers.3.self_attn.k_norm
+node layer3.k_norm op=rmsnorm family=Normalization inputs=["out:layer3.k_proj", "weight:layers.3.self_attn.k_norm"] shape=[5, 16] epsilon=float:1e-6 head_count=int:2 head_dimension=int:8
+kv 3 K
+node layer3.rope_k op=rope family=PositionEncoding inputs=["out:layer3.k_norm"] shape=[5, 16] base=float:10000.0 dimension=int:8 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:2 kv=(kv:3:K, K, append=false)
+kv 3 V
+node layer3.v_norm op=rmsnorm family=Normalization inputs=["out:layer3.v_proj"] shape=[5, 16] epsilon=float:1e-6 with_scale=bool:false head_count=int:2 head_dimension=int:8 kv=(kv:3:V, V, append=false)
+node layer3.attention op=attention family=Attention inputs=["out:layer3.rope_q", "out:layer3.rope_k", "out:layer3.v_norm"] shape=[5, 32] causal=bool:true head_count=int:4 kv_head_count=int:2 head_dimension=int:8 attention_mask_kind=text:causal scale=float:1.0 window_size=int:16
+weight layers.3.self_attn.o_proj
+node layer3.o_proj op=matmul family=LinearAlgebra inputs=["out:layer3.attention", "weight:layers.3.self_attn.o_proj"] shape=[5, 32]
+weight layers.3.post_attn_norm
+node layer3.post_attn_norm op=rmsnorm family=Normalization inputs=["out:layer3.o_proj", "weight:layers.3.post_attn_norm"] shape=[5, 32] epsilon=float:1e-6
+node layer3.residual1 op=residual-add family=Tensor inputs=["out:layer2.layer_scalar", "out:layer3.post_attn_norm"] shape=[5, 32]
+weight layers.3.pre_ffn_norm
+node layer3.pre_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer3.residual1", "weight:layers.3.pre_ffn_norm"] shape=[5, 32] epsilon=float:1e-6
+weight layers.3.mlp.gate_proj
+node layer3.gate_proj op=matmul family=LinearAlgebra inputs=["out:layer3.pre_ffn_norm", "weight:layers.3.mlp.gate_proj"] shape=[5, 64] tensor_parallel=text:column
+weight layers.3.mlp.up_proj
+node layer3.up_proj op=matmul family=LinearAlgebra inputs=["out:layer3.pre_ffn_norm", "weight:layers.3.mlp.up_proj"] shape=[5, 64] tensor_parallel=text:column
+node layer3.gelu op=gelu family=Activation inputs=["out:layer3.gate_proj"] shape=[5, 64] approximate=text:tanh tensor_parallel=text:local
+node layer3.mul op=mul family=Tensor inputs=["out:layer3.gelu", "out:layer3.up_proj"] shape=[5, 64] tensor_parallel=text:local
+weight layers.3.mlp.down_proj
+node layer3.down_proj op=matmul family=LinearAlgebra inputs=["out:layer3.mul", "weight:layers.3.mlp.down_proj"] shape=[5, 32] tensor_parallel=text:row
+weight layers.3.post_ffn_norm
+node layer3.post_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer3.down_proj", "weight:layers.3.post_ffn_norm"] shape=[5, 32] epsilon=float:1e-6
+node layer3.residual2 op=residual-add family=Tensor inputs=["out:layer3.residual1", "out:layer3.post_ffn_norm"] shape=[5, 32]
+weight layers.3.layer_scalar
+node layer3.layer_scalar op=mul family=Tensor inputs=["out:layer3.residual2", "weight:layers.3.layer_scalar"] shape=[5, 32]
+finish out:layer3.layer_scalar

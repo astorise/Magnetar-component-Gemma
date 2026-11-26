@@ -1,0 +1,210 @@
+begin Prefill sequence=8 offset=0
+input hidden_states_in [8, 1536]
+input token_ids [8]
+weight token_embedding
+node embedding_per_layer_inputs op=embedding family=Tensor inputs=["input:token_ids", "weight:token_embedding"] shape=[8, 1536] scale=float:39.191835884530846
+weight layers.13.input_norm
+node layer13.input_norm op=rmsnorm family=Normalization inputs=["input:hidden_states_in", "weight:layers.13.input_norm"] shape=[8, 1536] epsilon=float:1e-6
+weight layers.13.self_attn.q_proj
+node layer13.q_proj op=matmul family=LinearAlgebra inputs=["out:layer13.input_norm", "weight:layers.13.self_attn.q_proj"] shape=[8, 2048]
+weight layers.13.self_attn.q_norm
+node layer13.q_norm op=rmsnorm family=Normalization inputs=["out:layer13.q_proj", "weight:layers.13.self_attn.q_norm"] shape=[8, 2048] epsilon=float:1e-6 head_count=int:8 head_dimension=int:256
+node layer13.rope_q op=rope family=PositionEncoding inputs=["out:layer13.q_norm"] shape=[8, 2048] base=float:10000.0 dimension=int:256 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:8
+weight layers.13.self_attn.k_proj
+node layer13.k_proj op=matmul family=LinearAlgebra inputs=["out:layer13.input_norm", "weight:layers.13.self_attn.k_proj"] shape=[8, 256]
+weight layers.13.self_attn.v_proj
+node layer13.v_proj op=matmul family=LinearAlgebra inputs=["out:layer13.input_norm", "weight:layers.13.self_attn.v_proj"] shape=[8, 256]
+weight layers.13.self_attn.k_norm
+node layer13.k_norm op=rmsnorm family=Normalization inputs=["out:layer13.k_proj", "weight:layers.13.self_attn.k_norm"] shape=[8, 256] epsilon=float:1e-6 head_count=int:1 head_dimension=int:256
+kv 13 K
+node layer13.rope_k op=rope family=PositionEncoding inputs=["out:layer13.k_norm"] shape=[8, 256] base=float:10000.0 dimension=int:256 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:1 kv=(kv:13:K, K, append=false)
+kv 13 V
+node layer13.v_norm op=rmsnorm family=Normalization inputs=["out:layer13.v_proj"] shape=[8, 256] epsilon=float:1e-6 with_scale=bool:false head_count=int:1 head_dimension=int:256 kv=(kv:13:V, V, append=false)
+node layer13.attention op=attention family=Attention inputs=["out:layer13.rope_q", "out:layer13.rope_k", "out:layer13.v_norm"] shape=[8, 2048] causal=bool:true head_count=int:8 kv_head_count=int:1 head_dimension=int:256 attention_mask_kind=text:causal scale=float:1.0 window_size=int:512
+weight layers.13.self_attn.o_proj
+node layer13.o_proj op=matmul family=LinearAlgebra inputs=["out:layer13.attention", "weight:layers.13.self_attn.o_proj"] shape=[8, 1536]
+weight layers.13.post_attn_norm
+node layer13.post_attn_norm op=rmsnorm family=Normalization inputs=["out:layer13.o_proj", "weight:layers.13.post_attn_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer13.residual1 op=residual-add family=Tensor inputs=["input:hidden_states_in", "out:layer13.post_attn_norm"] shape=[8, 1536]
+weight layers.13.pre_ffn_norm
+node layer13.pre_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer13.residual1", "weight:layers.13.pre_ffn_norm"] shape=[8, 1536] epsilon=float:1e-6
+weight layers.13.mlp.gate_proj
+node layer13.gate_proj op=matmul family=LinearAlgebra inputs=["out:layer13.pre_ffn_norm", "weight:layers.13.mlp.gate_proj"] shape=[8, 6144] tensor_parallel=text:column
+weight layers.13.mlp.up_proj
+node layer13.up_proj op=matmul family=LinearAlgebra inputs=["out:layer13.pre_ffn_norm", "weight:layers.13.mlp.up_proj"] shape=[8, 6144] tensor_parallel=text:column
+node layer13.gelu op=gelu family=Activation inputs=["out:layer13.gate_proj"] shape=[8, 6144] approximate=text:tanh tensor_parallel=text:local
+node layer13.mul op=mul family=Tensor inputs=["out:layer13.gelu", "out:layer13.up_proj"] shape=[8, 6144] tensor_parallel=text:local
+weight layers.13.mlp.down_proj
+node layer13.down_proj op=matmul family=LinearAlgebra inputs=["out:layer13.mul", "weight:layers.13.mlp.down_proj"] shape=[8, 1536] tensor_parallel=text:row
+weight layers.13.post_ffn_norm
+node layer13.post_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer13.down_proj", "weight:layers.13.post_ffn_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer13.residual2 op=residual-add family=Tensor inputs=["out:layer13.residual1", "out:layer13.post_ffn_norm"] shape=[8, 1536]
+weight layers.13.per_layer_embedding
+node layer13.ple_token op=embedding family=Tensor inputs=["input:token_ids", "weight:layers.13.per_layer_embedding"] shape=[8, 256] scale=float:16.0
+weight layers.13.per_layer_model_projection
+node layer13.ple_context op=matmul family=LinearAlgebra inputs=["out:embedding_per_layer_inputs", "weight:layers.13.per_layer_model_projection"] shape=[8, 256]
+node layer13.ple_context_scale op=activation family=Activation inputs=["out:layer13.ple_context"] shape=[8, 256] kind=text:scale factor=float:0.02551551815399144
+weight per_layer_projection_norm
+node layer13.ple_context_norm op=rmsnorm family=Normalization inputs=["out:layer13.ple_context_scale", "weight:per_layer_projection_norm"] shape=[8, 256] epsilon=float:1e-6
+node layer13.ple_sum op=add family=Tensor inputs=["out:layer13.ple_context_norm", "out:layer13.ple_token"] shape=[8, 256]
+node layer13.ple_mix op=activation family=Activation inputs=["out:layer13.ple_sum"] shape=[8, 256] kind=text:scale factor=float:0.7071067811865476
+weight layers.13.per_layer_input_gate
+node layer13.ple_gate op=matmul family=LinearAlgebra inputs=["out:layer13.residual2", "weight:layers.13.per_layer_input_gate"] shape=[8, 256]
+node layer13.ple_gelu op=gelu family=Activation inputs=["out:layer13.ple_gate"] shape=[8, 256] approximate=text:tanh tensor_parallel=text:local
+node layer13.ple_mul op=mul family=Tensor inputs=["out:layer13.ple_gelu", "out:layer13.ple_mix"] shape=[8, 256]
+weight layers.13.per_layer_projection
+node layer13.ple_projection op=matmul family=LinearAlgebra inputs=["out:layer13.ple_mul", "weight:layers.13.per_layer_projection"] shape=[8, 1536]
+weight layers.13.post_per_layer_input_norm
+node layer13.ple_post_norm op=rmsnorm family=Normalization inputs=["out:layer13.ple_projection", "weight:layers.13.post_per_layer_input_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer13.ple_residual op=residual-add family=Tensor inputs=["out:layer13.residual2", "out:layer13.ple_post_norm"] shape=[8, 1536]
+weight layers.13.layer_scalar
+node layer13.layer_scalar op=mul family=Tensor inputs=["out:layer13.ple_residual", "weight:layers.13.layer_scalar"] shape=[8, 1536]
+weight layers.14.input_norm
+node layer14.input_norm op=rmsnorm family=Normalization inputs=["out:layer13.layer_scalar", "weight:layers.14.input_norm"] shape=[8, 1536] epsilon=float:1e-6
+weight layers.14.self_attn.q_proj
+node layer14.q_proj op=matmul family=LinearAlgebra inputs=["out:layer14.input_norm", "weight:layers.14.self_attn.q_proj"] shape=[8, 4096]
+weight layers.14.self_attn.q_norm
+node layer14.q_norm op=rmsnorm family=Normalization inputs=["out:layer14.q_proj", "weight:layers.14.self_attn.q_norm"] shape=[8, 4096] epsilon=float:1e-6 head_count=int:8 head_dimension=int:512
+node layer14.rope_q op=rope family=PositionEncoding inputs=["out:layer14.q_norm"] shape=[8, 4096] base=float:1000000.0 dimension=int:512 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:8 partial_rotary_factor=float:0.25
+weight layers.14.self_attn.k_proj
+node layer14.k_proj op=matmul family=LinearAlgebra inputs=["out:layer14.input_norm", "weight:layers.14.self_attn.k_proj"] shape=[8, 512]
+weight layers.14.self_attn.v_proj
+node layer14.v_proj op=matmul family=LinearAlgebra inputs=["out:layer14.input_norm", "weight:layers.14.self_attn.v_proj"] shape=[8, 512]
+weight layers.14.self_attn.k_norm
+node layer14.k_norm op=rmsnorm family=Normalization inputs=["out:layer14.k_proj", "weight:layers.14.self_attn.k_norm"] shape=[8, 512] epsilon=float:1e-6 head_count=int:1 head_dimension=int:512
+kv 14 K
+node layer14.rope_k op=rope family=PositionEncoding inputs=["out:layer14.k_norm"] shape=[8, 512] base=float:1000000.0 dimension=int:512 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:1 partial_rotary_factor=float:0.25 kv=(kv:14:K, K, append=false)
+kv 14 V
+node layer14.v_norm op=rmsnorm family=Normalization inputs=["out:layer14.v_proj"] shape=[8, 512] epsilon=float:1e-6 with_scale=bool:false head_count=int:1 head_dimension=int:512 kv=(kv:14:V, V, append=false)
+node layer14.attention op=attention family=Attention inputs=["out:layer14.rope_q", "out:layer14.rope_k", "out:layer14.v_norm"] shape=[8, 4096] causal=bool:true head_count=int:8 kv_head_count=int:1 head_dimension=int:512 attention_mask_kind=text:causal scale=float:1.0
+weight layers.14.self_attn.o_proj
+node layer14.o_proj op=matmul family=LinearAlgebra inputs=["out:layer14.attention", "weight:layers.14.self_attn.o_proj"] shape=[8, 1536]
+weight layers.14.post_attn_norm
+node layer14.post_attn_norm op=rmsnorm family=Normalization inputs=["out:layer14.o_proj", "weight:layers.14.post_attn_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer14.residual1 op=residual-add family=Tensor inputs=["out:layer13.layer_scalar", "out:layer14.post_attn_norm"] shape=[8, 1536]
+weight layers.14.pre_ffn_norm
+node layer14.pre_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer14.residual1", "weight:layers.14.pre_ffn_norm"] shape=[8, 1536] epsilon=float:1e-6
+weight layers.14.mlp.gate_proj
+node layer14.gate_proj op=matmul family=LinearAlgebra inputs=["out:layer14.pre_ffn_norm", "weight:layers.14.mlp.gate_proj"] shape=[8, 6144] tensor_parallel=text:column
+weight layers.14.mlp.up_proj
+node layer14.up_proj op=matmul family=LinearAlgebra inputs=["out:layer14.pre_ffn_norm", "weight:layers.14.mlp.up_proj"] shape=[8, 6144] tensor_parallel=text:column
+node layer14.gelu op=gelu family=Activation inputs=["out:layer14.gate_proj"] shape=[8, 6144] approximate=text:tanh tensor_parallel=text:local
+node layer14.mul op=mul family=Tensor inputs=["out:layer14.gelu", "out:layer14.up_proj"] shape=[8, 6144] tensor_parallel=text:local
+weight layers.14.mlp.down_proj
+node layer14.down_proj op=matmul family=LinearAlgebra inputs=["out:layer14.mul", "weight:layers.14.mlp.down_proj"] shape=[8, 1536] tensor_parallel=text:row
+weight layers.14.post_ffn_norm
+node layer14.post_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer14.down_proj", "weight:layers.14.post_ffn_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer14.residual2 op=residual-add family=Tensor inputs=["out:layer14.residual1", "out:layer14.post_ffn_norm"] shape=[8, 1536]
+weight layers.14.per_layer_embedding
+node layer14.ple_token op=embedding family=Tensor inputs=["input:token_ids", "weight:layers.14.per_layer_embedding"] shape=[8, 256] scale=float:16.0
+weight layers.14.per_layer_model_projection
+node layer14.ple_context op=matmul family=LinearAlgebra inputs=["out:embedding_per_layer_inputs", "weight:layers.14.per_layer_model_projection"] shape=[8, 256]
+node layer14.ple_context_scale op=activation family=Activation inputs=["out:layer14.ple_context"] shape=[8, 256] kind=text:scale factor=float:0.02551551815399144
+weight per_layer_projection_norm
+node layer14.ple_context_norm op=rmsnorm family=Normalization inputs=["out:layer14.ple_context_scale", "weight:per_layer_projection_norm"] shape=[8, 256] epsilon=float:1e-6
+node layer14.ple_sum op=add family=Tensor inputs=["out:layer14.ple_context_norm", "out:layer14.ple_token"] shape=[8, 256]
+node layer14.ple_mix op=activation family=Activation inputs=["out:layer14.ple_sum"] shape=[8, 256] kind=text:scale factor=float:0.7071067811865476
+weight layers.14.per_layer_input_gate
+node layer14.ple_gate op=matmul family=LinearAlgebra inputs=["out:layer14.residual2", "weight:layers.14.per_layer_input_gate"] shape=[8, 256]
+node layer14.ple_gelu op=gelu family=Activation inputs=["out:layer14.ple_gate"] shape=[8, 256] approximate=text:tanh tensor_parallel=text:local
+node layer14.ple_mul op=mul family=Tensor inputs=["out:layer14.ple_gelu", "out:layer14.ple_mix"] shape=[8, 256]
+weight layers.14.per_layer_projection
+node layer14.ple_projection op=matmul family=LinearAlgebra inputs=["out:layer14.ple_mul", "weight:layers.14.per_layer_projection"] shape=[8, 1536]
+weight layers.14.post_per_layer_input_norm
+node layer14.ple_post_norm op=rmsnorm family=Normalization inputs=["out:layer14.ple_projection", "weight:layers.14.post_per_layer_input_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer14.ple_residual op=residual-add family=Tensor inputs=["out:layer14.residual2", "out:layer14.ple_post_norm"] shape=[8, 1536]
+weight layers.14.layer_scalar
+node layer14.layer_scalar op=mul family=Tensor inputs=["out:layer14.ple_residual", "weight:layers.14.layer_scalar"] shape=[8, 1536]
+weight layers.15.input_norm
+node layer15.input_norm op=rmsnorm family=Normalization inputs=["out:layer14.layer_scalar", "weight:layers.15.input_norm"] shape=[8, 1536] epsilon=float:1e-6
+weight layers.15.self_attn.q_proj
+node layer15.q_proj op=matmul family=LinearAlgebra inputs=["out:layer15.input_norm", "weight:layers.15.self_attn.q_proj"] shape=[8, 2048]
+weight layers.15.self_attn.q_norm
+node layer15.q_norm op=rmsnorm family=Normalization inputs=["out:layer15.q_proj", "weight:layers.15.self_attn.q_norm"] shape=[8, 2048] epsilon=float:1e-6 head_count=int:8 head_dimension=int:256
+node layer15.rope_q op=rope family=PositionEncoding inputs=["out:layer15.q_norm"] shape=[8, 2048] base=float:10000.0 dimension=int:256 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:8
+node layer15.attention op=attention family=Attention inputs=["out:layer15.rope_q", "out:layer13.rope_k", "out:layer13.v_norm"] shape=[8, 2048] causal=bool:true head_count=int:8 kv_head_count=int:1 head_dimension=int:256 attention_mask_kind=text:causal scale=float:1.0 window_size=int:512
+weight layers.15.self_attn.o_proj
+node layer15.o_proj op=matmul family=LinearAlgebra inputs=["out:layer15.attention", "weight:layers.15.self_attn.o_proj"] shape=[8, 1536]
+weight layers.15.post_attn_norm
+node layer15.post_attn_norm op=rmsnorm family=Normalization inputs=["out:layer15.o_proj", "weight:layers.15.post_attn_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer15.residual1 op=residual-add family=Tensor inputs=["out:layer14.layer_scalar", "out:layer15.post_attn_norm"] shape=[8, 1536]
+weight layers.15.pre_ffn_norm
+node layer15.pre_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer15.residual1", "weight:layers.15.pre_ffn_norm"] shape=[8, 1536] epsilon=float:1e-6
+weight layers.15.mlp.gate_proj
+node layer15.gate_proj op=matmul family=LinearAlgebra inputs=["out:layer15.pre_ffn_norm", "weight:layers.15.mlp.gate_proj"] shape=[8, 12288] tensor_parallel=text:column
+weight layers.15.mlp.up_proj
+node layer15.up_proj op=matmul family=LinearAlgebra inputs=["out:layer15.pre_ffn_norm", "weight:layers.15.mlp.up_proj"] shape=[8, 12288] tensor_parallel=text:column
+node layer15.gelu op=gelu family=Activation inputs=["out:layer15.gate_proj"] shape=[8, 12288] approximate=text:tanh tensor_parallel=text:local
+node layer15.mul op=mul family=Tensor inputs=["out:layer15.gelu", "out:layer15.up_proj"] shape=[8, 12288] tensor_parallel=text:local
+weight layers.15.mlp.down_proj
+node layer15.down_proj op=matmul family=LinearAlgebra inputs=["out:layer15.mul", "weight:layers.15.mlp.down_proj"] shape=[8, 1536] tensor_parallel=text:row
+weight layers.15.post_ffn_norm
+node layer15.post_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer15.down_proj", "weight:layers.15.post_ffn_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer15.residual2 op=residual-add family=Tensor inputs=["out:layer15.residual1", "out:layer15.post_ffn_norm"] shape=[8, 1536]
+weight layers.15.per_layer_embedding
+node layer15.ple_token op=embedding family=Tensor inputs=["input:token_ids", "weight:layers.15.per_layer_embedding"] shape=[8, 256] scale=float:16.0
+weight layers.15.per_layer_model_projection
+node layer15.ple_context op=matmul family=LinearAlgebra inputs=["out:embedding_per_layer_inputs", "weight:layers.15.per_layer_model_projection"] shape=[8, 256]
+node layer15.ple_context_scale op=activation family=Activation inputs=["out:layer15.ple_context"] shape=[8, 256] kind=text:scale factor=float:0.02551551815399144
+weight per_layer_projection_norm
+node layer15.ple_context_norm op=rmsnorm family=Normalization inputs=["out:layer15.ple_context_scale", "weight:per_layer_projection_norm"] shape=[8, 256] epsilon=float:1e-6
+node layer15.ple_sum op=add family=Tensor inputs=["out:layer15.ple_context_norm", "out:layer15.ple_token"] shape=[8, 256]
+node layer15.ple_mix op=activation family=Activation inputs=["out:layer15.ple_sum"] shape=[8, 256] kind=text:scale factor=float:0.7071067811865476
+weight layers.15.per_layer_input_gate
+node layer15.ple_gate op=matmul family=LinearAlgebra inputs=["out:layer15.residual2", "weight:layers.15.per_layer_input_gate"] shape=[8, 256]
+node layer15.ple_gelu op=gelu family=Activation inputs=["out:layer15.ple_gate"] shape=[8, 256] approximate=text:tanh tensor_parallel=text:local
+node layer15.ple_mul op=mul family=Tensor inputs=["out:layer15.ple_gelu", "out:layer15.ple_mix"] shape=[8, 256]
+weight layers.15.per_layer_projection
+node layer15.ple_projection op=matmul family=LinearAlgebra inputs=["out:layer15.ple_mul", "weight:layers.15.per_layer_projection"] shape=[8, 1536]
+weight layers.15.post_per_layer_input_norm
+node layer15.ple_post_norm op=rmsnorm family=Normalization inputs=["out:layer15.ple_projection", "weight:layers.15.post_per_layer_input_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer15.ple_residual op=residual-add family=Tensor inputs=["out:layer15.residual2", "out:layer15.ple_post_norm"] shape=[8, 1536]
+weight layers.15.layer_scalar
+node layer15.layer_scalar op=mul family=Tensor inputs=["out:layer15.ple_residual", "weight:layers.15.layer_scalar"] shape=[8, 1536]
+weight layers.16.input_norm
+node layer16.input_norm op=rmsnorm family=Normalization inputs=["out:layer15.layer_scalar", "weight:layers.16.input_norm"] shape=[8, 1536] epsilon=float:1e-6
+weight layers.16.self_attn.q_proj
+node layer16.q_proj op=matmul family=LinearAlgebra inputs=["out:layer16.input_norm", "weight:layers.16.self_attn.q_proj"] shape=[8, 2048]
+weight layers.16.self_attn.q_norm
+node layer16.q_norm op=rmsnorm family=Normalization inputs=["out:layer16.q_proj", "weight:layers.16.self_attn.q_norm"] shape=[8, 2048] epsilon=float:1e-6 head_count=int:8 head_dimension=int:256
+node layer16.rope_q op=rope family=PositionEncoding inputs=["out:layer16.q_norm"] shape=[8, 2048] base=float:10000.0 dimension=int:256 position_mode=text:sequential rotation_pairing=text:half_split position_offset=int:0 head_count=int:8
+node layer16.attention op=attention family=Attention inputs=["out:layer16.rope_q", "out:layer13.rope_k", "out:layer13.v_norm"] shape=[8, 2048] causal=bool:true head_count=int:8 kv_head_count=int:1 head_dimension=int:256 attention_mask_kind=text:causal scale=float:1.0 window_size=int:512
+weight layers.16.self_attn.o_proj
+node layer16.o_proj op=matmul family=LinearAlgebra inputs=["out:layer16.attention", "weight:layers.16.self_attn.o_proj"] shape=[8, 1536]
+weight layers.16.post_attn_norm
+node layer16.post_attn_norm op=rmsnorm family=Normalization inputs=["out:layer16.o_proj", "weight:layers.16.post_attn_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer16.residual1 op=residual-add family=Tensor inputs=["out:layer15.layer_scalar", "out:layer16.post_attn_norm"] shape=[8, 1536]
+weight layers.16.pre_ffn_norm
+node layer16.pre_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer16.residual1", "weight:layers.16.pre_ffn_norm"] shape=[8, 1536] epsilon=float:1e-6
+weight layers.16.mlp.gate_proj
+node layer16.gate_proj op=matmul family=LinearAlgebra inputs=["out:layer16.pre_ffn_norm", "weight:layers.16.mlp.gate_proj"] shape=[8, 12288] tensor_parallel=text:column
+weight layers.16.mlp.up_proj
+node layer16.up_proj op=matmul family=LinearAlgebra inputs=["out:layer16.pre_ffn_norm", "weight:layers.16.mlp.up_proj"] shape=[8, 12288] tensor_parallel=text:column
+node layer16.gelu op=gelu family=Activation inputs=["out:layer16.gate_proj"] shape=[8, 12288] approximate=text:tanh tensor_parallel=text:local
+node layer16.mul op=mul family=Tensor inputs=["out:layer16.gelu", "out:layer16.up_proj"] shape=[8, 12288] tensor_parallel=text:local
+weight layers.16.mlp.down_proj
+node layer16.down_proj op=matmul family=LinearAlgebra inputs=["out:layer16.mul", "weight:layers.16.mlp.down_proj"] shape=[8, 1536] tensor_parallel=text:row
+weight layers.16.post_ffn_norm
+node layer16.post_ffn_norm op=rmsnorm family=Normalization inputs=["out:layer16.down_proj", "weight:layers.16.post_ffn_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer16.residual2 op=residual-add family=Tensor inputs=["out:layer16.residual1", "out:layer16.post_ffn_norm"] shape=[8, 1536]
+weight layers.16.per_layer_embedding
+node layer16.ple_token op=embedding family=Tensor inputs=["input:token_ids", "weight:layers.16.per_layer_embedding"] shape=[8, 256] scale=float:16.0
+weight layers.16.per_layer_model_projection
+node layer16.ple_context op=matmul family=LinearAlgebra inputs=["out:embedding_per_layer_inputs", "weight:layers.16.per_layer_model_projection"] shape=[8, 256]
+node layer16.ple_context_scale op=activation family=Activation inputs=["out:layer16.ple_context"] shape=[8, 256] kind=text:scale factor=float:0.02551551815399144
+weight per_layer_projection_norm
+node layer16.ple_context_norm op=rmsnorm family=Normalization inputs=["out:layer16.ple_context_scale", "weight:per_layer_projection_norm"] shape=[8, 256] epsilon=float:1e-6
+node layer16.ple_sum op=add family=Tensor inputs=["out:layer16.ple_context_norm", "out:layer16.ple_token"] shape=[8, 256]
+node layer16.ple_mix op=activation family=Activation inputs=["out:layer16.ple_sum"] shape=[8, 256] kind=text:scale factor=float:0.7071067811865476
+weight layers.16.per_layer_input_gate
+node layer16.ple_gate op=matmul family=LinearAlgebra inputs=["out:layer16.residual2", "weight:layers.16.per_layer_input_gate"] shape=[8, 256]
+node layer16.ple_gelu op=gelu family=Activation inputs=["out:layer16.ple_gate"] shape=[8, 256] approximate=text:tanh tensor_parallel=text:local
+node layer16.ple_mul op=mul family=Tensor inputs=["out:layer16.ple_gelu", "out:layer16.ple_mix"] shape=[8, 256]
+weight layers.16.per_layer_projection
+node layer16.ple_projection op=matmul family=LinearAlgebra inputs=["out:layer16.ple_mul", "weight:layers.16.per_layer_projection"] shape=[8, 1536]
+weight layers.16.post_per_layer_input_norm
+node layer16.ple_post_norm op=rmsnorm family=Normalization inputs=["out:layer16.ple_projection", "weight:layers.16.post_per_layer_input_norm"] shape=[8, 1536] epsilon=float:1e-6
+node layer16.ple_residual op=residual-add family=Tensor inputs=["out:layer16.residual2", "out:layer16.ple_post_norm"] shape=[8, 1536]
+weight layers.16.layer_scalar
+node layer16.layer_scalar op=mul family=Tensor inputs=["out:layer16.ple_residual", "weight:layers.16.layer_scalar"] shape=[8, 1536]
+finish out:layer16.layer_scalar
