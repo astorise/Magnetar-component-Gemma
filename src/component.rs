@@ -6,88 +6,14 @@ wit_bindgen::generate!({
     world: "model-component-graph-producer",
 });
 
-use crate::plan::{
-    self, Architecture, Attr, Config, GraphSink, KvRole, LayerSpec, Moe, Node, Options, Phase,
-    Segment, Value,
-};
+use crate::plan::{self, Architecture, Config, LayerSpec, Moe, Options, Phase, Segment};
 use magnetar::model_component_graph::graph_builder as gb;
 use magnetar::model_component_graph::model_config;
 
 struct Host;
 
-impl GraphSink for Host {
-    fn begin_graph(&mut self, phase: Phase, sequence_length: u64, position_offset: u64) {
-        let phase = match phase {
-            Phase::Prefill => gb::GraphPhase::Prefill,
-            Phase::Decode => gb::GraphPhase::Decode,
-        };
-        gb::begin_graph(phase, sequence_length, position_offset);
-    }
-
-    fn declare_input(&mut self, name: &str, shape: &[u64]) -> String {
-        gb::declare_input(
-            name,
-            &gb::TensorShape {
-                dimensions: shape.to_vec(),
-            },
-        )
-    }
-
-    fn weight_edge(&mut self, logical_name: &str) -> String {
-        gb::weight_edge(logical_name)
-    }
-
-    fn alias_weight_edge(&mut self, edge: &str, target_logical_name: &str) {
-        gb::alias_weight_edge(edge, target_logical_name);
-    }
-
-    fn kv_resource(&mut self, layer: u64, role: KvRole) -> String {
-        gb::kv_resource(layer, wit_role(role))
-    }
-
-    fn add_node(&mut self, node: Node) -> String {
-        let attrs: Vec<gb::Attribute> = node.attrs.iter().map(wit_attr).collect();
-        let kv = node.kv.as_ref().map(|kv| gb::KvInvolvement {
-            resource_id: kv.resource.clone(),
-            role: wit_role(kv.role),
-            append: kv.append,
-        });
-        gb::add_node(
-            &node.id,
-            node.operator,
-            node.family,
-            &attrs,
-            &node.inputs,
-            &gb::TensorShape {
-                dimensions: node.shape,
-            },
-            kv.as_ref(),
-        )
-    }
-
-    fn finish_graph(&mut self, output_edge: &str) -> String {
-        gb::finish_graph(output_edge)
-    }
-}
-
-fn wit_role(role: KvRole) -> gb::KvCacheRole {
-    match role {
-        KvRole::K => gb::KvCacheRole::K,
-        KvRole::V => gb::KvCacheRole::V,
-    }
-}
-
-fn wit_attr(attr: &Attr) -> gb::Attribute {
-    gb::Attribute {
-        name: attr.name.to_string(),
-        value: match &attr.value {
-            Value::Bool(b) => gb::AttributeValue::Boolean(*b),
-            Value::Int(i) => gb::AttributeValue::Integer(*i),
-            Value::Float(f) => gb::AttributeValue::FloatValue(*f),
-            Value::Text(t) => gb::AttributeValue::Text(t.clone()),
-        },
-    }
-}
+// The graph-builder adapter is the SDK's, written once for every Component.
+magnetar_component_sdk::wit_graph_sink!(Host, gb);
 
 /// Reads the active Model Instance's configuration. Each call re-queries the
 /// Capabilities: no dimension is cached or compiled in.
