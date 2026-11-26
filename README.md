@@ -86,7 +86,9 @@ Verified against `transformers`' `modeling_gemma4.py` and the checkpoints'
 ## Governing contract
 
 Targets `magnetar:model-component-graph`, world `model-component-graph-producer`
-(`wit/model-component-graph.wit`, version **1.8.0**): the `1.5.0`
+(version **1.8.0**, from [`magnetar-component-api`](https://github.com/astorise/magnetar-component-api)
+with its `v1_8` feature, pinned by commit: this repository carries no copy of the
+WIT file): the `1.5.0`
 `graph-builder` and `model-config` interfaces unchanged, plus a **family-neutral,
 additive** extension of `model-config` (nothing in it names Gemma, and the
 Component imports no interface of its own):
@@ -106,6 +108,20 @@ Weight logical names follow `components/llama` (`layers.N.self_attn.q_proj`,
 `layers.N.mlp.gate_proj`, ...) plus `q_norm`, `k_norm`, `pre_ffn_norm`,
 `post_ffn_norm`, `layer_scalar` per layer; MoE and per-layer-input names are
 listed in the requirements document.
+
+## Built on the shared crates
+
+The graph IR (`Phase`, `KvRole`, `Value`, `Attr`, `Kv`, `Node`), the `GraphSink`
+the builder writes to and the adapter to the contract's `graph-builder` come from
+[`magnetar-component-sdk`](https://github.com/astorise/magnetar-component-sdk),
+and the contract and its bindings from `magnetar-component-api`. Both are git
+dependencies pinned by commit while they are in development, and published once
+stable. `src/plan.rs` keeps only what is specific to Gemma: the configuration, its
+validation and the graph.
+
+`tests/golden/` holds the graphs the builder emits, recorded before it moved onto
+either crate; `tests/golden_graphs.rs` compares every call against them. Regenerate
+them deliberately with `UPDATE_GOLDEN=1 cargo test --test golden_graphs`.
 
 ## Runtime prerequisites
 

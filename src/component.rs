@@ -1,14 +1,11 @@
 //! WIT adapter: `graph-builder` -> [`GraphSink`], `model-config` ->
 //! [`Config`], and the Component exports.
 
-wit_bindgen::generate!({
-    path: "wit/model-component-graph.wit",
-    world: "model-component-graph-producer",
-});
-
 use crate::plan::{self, Architecture, Config, LayerSpec, Moe, Options, Phase, Segment};
-use magnetar::model_component_graph::graph_builder as gb;
-use magnetar::model_component_graph::model_config;
+use magnetar_component_api::v1_8::{
+    Guest, export,
+    magnetar::model_component_graph::{graph_builder as gb, model_config},
+};
 
 struct Host;
 
